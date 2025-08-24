@@ -1,17 +1,17 @@
-- name: data_uploader_daily
-  env:
-    BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
-    DATABASE_URL: ${{ secrets.DATABASE_URL }}   # or the NEON_* ones your script expects
-  run: python data_uploader.py
+name: data_uploader_daily
 
 on:
+  workflow_dispatch: {}          # allows manual "Run workflow"
   schedule:
-    - cron: "10 13 * * *"   # 09:10 ET (cron uses UTC)
-  workflow_dispatch: {}
+    - cron: "10 13 * * *"        # daily at 09:10 ET (cron is UTC)
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    # Make secrets available to every step in this job
+    env:
+      BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}  # or your NEON_* pieces if your script assembles the URL
     steps:
       - uses: actions/checkout@v4
 
@@ -26,16 +26,14 @@ jobs:
             pip install -r requirements.txt
           else
             echo "requirements.txt not found; installing minimal deps…"
-            pip install \
-              cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
+            pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
           fi
 
       - name: Debug versions (optional)
         run: |
           python -c "import sys, pandas, sqlalchemy, cfbd; print('py', sys.version); print('pandas', pandas.__version__); print('sqlalchemy', sqlalchemy.__version__); print('cfbd', cfbd.__version__)"
-      
+
       - name: Run uploader
-        env:
-          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}   # or NEON_* pieces if your script expects them
+        # If data_uploader.py lives in a subfolder, add:
+        # working-directory: path/to/folder
         run: python data_uploader.py
