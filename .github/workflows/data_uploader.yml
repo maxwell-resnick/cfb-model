@@ -1,25 +1,41 @@
-name: data_uploader_daily
+name: data_uploader_hourly_7am_10pm_ET
 
 on:
-  workflow_dispatch: {}          # allows manual "Run workflow"
+  # fire every hour on the hour (UTC)
   schedule:
-    - cron: "10 13 * * *"        # daily at 09:10 ET (cron is UTC)
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    # Make secrets available to every step in this job
     env:
       BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}  # or your NEON_* pieces if your script assembles the URL
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
     steps:
+      - name: Time gate (run only 07–22 America/New_York)
+        id: timegate
+        run: |
+          HOUR_NY=$(TZ=America/New_York date +%H)
+          echo "Local NY hour: $HOUR_NY"
+          if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "Outside 07–22 NY window. Skipping."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.timegate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.timegate.outputs.run == 'true'
         with:
           python-version: "3.11"
 
       - name: Install deps
+        if: steps.timegate.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -30,10 +46,10 @@ jobs:
           fi
 
       - name: Debug versions (optional)
+        if: steps.timegate.outputs.run == 'true'
         run: |
           python -c "import sys, pandas, sqlalchemy, cfbd; print('py', sys.version); print('pandas', pandas.__version__); print('sqlalchemy', sqlalchemy.__version__); print('cfbd', cfbd.__version__)"
 
       - name: Run uploader
-        # If data_uploader.py lives in a subfolder, add:
-        # working-directory: path/to/folder
+        if: steps.timegate.outputs.run == 'true'
         run: python data_uploader.py
