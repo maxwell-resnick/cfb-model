@@ -1,0 +1,8 @@
+cfbd>=4.6.0
+pandas>=2.1
+numpy>=1.25
+SQLAlchemy>=2.0
+pg8000>=1.30
+python-dotenv>=1.0
+certifi>=2024.2.2
+filelock>=3.13
