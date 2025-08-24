@@ -1,0 +1,39 @@
+name: data_uploader_daily
+
+on:
+  schedule:
+    # ─────────────── runs every day at 09:10 ET ───────────────
+    # GitHub Actions uses UTC; 09:10 ET (EDT = UTC-4) = 13:10 UTC
+    - cron: "10 13 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
+  push:
+    paths:
+      - "data_uploader.py"
+      - ".github/workflows/data_uploader.yml"
+      - "requirements.txt"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run uploader
+        env:
+          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+          # Either pass a single DATABASE_URL or individual pieces your script expects:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEON_USER:  ${{ secrets.NEON_USER }}
+          NEON_PASS:  ${{ secrets.NEON_PASS }}
+          NEON_HOST:  ${{ secrets.NEON_HOST }}
+          NEON_DB:    ${{ secrets.NEON_DB }}
+        run: python data_uploader.py
