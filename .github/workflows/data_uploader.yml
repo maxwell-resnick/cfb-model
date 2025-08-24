@@ -1,10 +1,13 @@
-name: data_uploader_hourly_7am_10pm_ET
+name: data_uploader_daily
 
 on:
-  # fire every hour on the hour (UTC)
+  workflow_dispatch: {}          # manual "Run workflow"
   schedule:
-    - cron: "0 * * * *"
-  workflow_dispatch: {}
+    - cron: "0 * * * *"          # tick every hour (UTC)
+
+concurrency:
+  group: data_uploader
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -12,8 +15,10 @@ jobs:
     env:
       BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
+      # Gate by local New York time so we only run 07–22
       - name: Time gate (run only 07–22 America/New_York)
         id: timegate
         run: |
@@ -45,11 +50,91 @@ jobs:
             pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
           fi
 
-      - name: Debug versions (optional)
+      - name: Check secrets present
         if: steps.timegate.outputs.run == 'true'
         run: |
-          python -c "import sys, pandas, sqlalchemy, cfbd; print('py', sys.version); print('pandas', pandas.__version__); print('sqlalchemy', sqlalchemy.__version__); print('cfbd', cfbd.__version__)"
+          [ -n "${BEARER_TOKEN}" ] || { echo "❌ BEARER_TOKEN missing"; exit 1; }
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "⚠️ DATABASE_URL empty (ok if your script builds it another way)"
+          fi
+          [ -n "${DISCORD_WEBHOOK}" ] || echo "⚠️ DISCORD_WEBHOOK not set; Discord notifications will be skipped"
 
+      # Run your uploader and capture logs
       - name: Run uploader
         if: steps.timegate.outputs.run == 'true'
-        run: python data_uploader.py
+        id: run_uploader
+        shell: bash
+        run: |
+          set -o pipefail
+          python data_uploader.py 2>&1 | tee uploader.log
+
+      # Parse "Upserted rows: N" from the log (optional)
+      - name: Parse upsert count
+        if: steps.timegate.outputs.run == 'true'
+        id: stats
+        shell: bash
+        run: |
+          UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
+          UPS=${UPS:-0}
+          echo "upserted=$UPS" >> $GITHUB_OUTPUT
+          echo "Parsed Upserted rows: $UPS"
+
+      # Always save the log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uploader-log
+          path: uploader.log
+          retention-days: 7
+
+      # Discord: success
+      - name: Notify Discord (success)
+        if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
+        env:
+          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          UPS="${{ steps.stats.outputs.upserted }}"
+          PAYLOAD=$(cat <<'JSON'
+          {
+            "username": "CFB Uploader",
+            "embeds": [{
+              "title": "✅ data_uploader succeeded",
+              "description": "Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**",
+              "url": "RUN_URL_PLACEHOLDER",
+              "timestamp": "NOW_PLACEHOLDER",
+              "color": 3066993
+            }]
+          }
+          JSON
+          )
+          PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
+          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+
+      # Discord: failure
+      - name: Notify Discord (failure)
+        if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
+        env:
+          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PAYLOAD=$(cat <<'JSON'
+          {
+            "username": "CFB Uploader",
+            "embeds": [{
+              "title": "❌ data_uploader failed",
+              "description": "Branch: **${{ github.ref_name }}**\nSee run logs for details.",
+              "url": "RUN_URL_PLACEHOLDER",
+              "timestamp": "NOW_PLACEHOLDER",
+              "color": 15158332
+            }]
+          }
+          JSON
+          )
+          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
