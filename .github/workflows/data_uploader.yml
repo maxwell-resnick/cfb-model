@@ -1,13 +1,18 @@
 name: data_uploader_daily
 
 on:
-  workflow_dispatch: {}          # manual "Run workflow"
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Bypass NY time gate (true/false)'
+        required: false
+        default: 'false'
+      simulate_failure:
+        description: 'Force a failure to test notifications (true/false)'
+        required: false
+        default: 'false'
   schedule:
-    - cron: "0 * * * *"          # tick every hour (UTC)
-
-concurrency:
-  group: data_uploader
-  cancel-in-progress: true
+    - cron: "0 * * * *"  # hourly (UTC)
 
 jobs:
   run:
@@ -16,12 +21,18 @@ jobs:
       BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      FORCE_RUN: ${{ github.event.inputs.force_run }}
+      SIM_FAIL:  ${{ github.event.inputs.simulate_failure }}
 
     steps:
-      # Gate by local New York time so we only run 07–22
-      - name: Time gate (run only 07–22 America/New_York)
+      - name: Time gate (run only 07–22 America/New_York, unless forced)
         id: timegate
         run: |
+          if [ "${FORCE_RUN}" = "true" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+            echo "Force-run enabled; skipping time window check."
+            exit 0
+          fi
           HOUR_NY=$(TZ=America/New_York date +%H)
           echo "Local NY hour: $HOUR_NY"
           if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
@@ -46,40 +57,25 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            echo "requirements.txt not found; installing minimal deps…"
             pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
           fi
 
-      - name: Check secrets present
-        if: steps.timegate.outputs.run == 'true'
-        run: |
-          [ -n "${BEARER_TOKEN}" ] || { echo "❌ BEARER_TOKEN missing"; exit 1; }
-          if [ -z "${DATABASE_URL}" ]; then
-            echo "⚠️ DATABASE_URL empty (ok if your script builds it another way)"
-          fi
-          [ -n "${DISCORD_WEBHOOK}" ] || echo "⚠️ DISCORD_WEBHOOK not set; Discord notifications will be skipped"
-
-      # Run your uploader and capture logs
       - name: Run uploader
         if: steps.timegate.outputs.run == 'true'
         id: run_uploader
-        shell: bash
         run: |
           set -o pipefail
           python data_uploader.py 2>&1 | tee uploader.log
 
-      # Parse "Upserted rows: N" from the log (optional)
       - name: Parse upsert count
         if: steps.timegate.outputs.run == 'true'
         id: stats
-        shell: bash
         run: |
           UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
           UPS=${UPS:-0}
           echo "upserted=$UPS" >> $GITHUB_OUTPUT
           echo "Parsed Upserted rows: $UPS"
 
-      # Always save the log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -87,7 +83,14 @@ jobs:
           path: uploader.log
           retention-days: 7
 
-      # Discord: success
+      # --- Test failure on demand
+      - name: Simulate failure (for testing notifications)
+        if: steps.timegate.outputs.run == 'true' && env.SIM_FAIL == 'true'
+        run: |
+          echo "Simulating failure as requested." >&2
+          exit 1
+
+      # --- Discord: success
       - name: Notify Discord (success)
         if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
         env:
@@ -97,16 +100,7 @@ jobs:
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           UPS="${{ steps.stats.outputs.upserted }}"
           PAYLOAD=$(cat <<'JSON'
-          {
-            "username": "CFB Uploader",
-            "embeds": [{
-              "title": "✅ data_uploader succeeded",
-              "description": "Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**",
-              "url": "RUN_URL_PLACEHOLDER",
-              "timestamp": "NOW_PLACEHOLDER",
-              "color": 3066993
-            }]
-          }
+          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
           JSON
           )
           PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
@@ -114,7 +108,7 @@ jobs:
           PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-      # Discord: failure
+      # --- Discord: failure
       - name: Notify Discord (failure)
         if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
         env:
@@ -123,18 +117,10 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           PAYLOAD=$(cat <<'JSON'
-          {
-            "username": "CFB Uploader",
-            "embeds": [{
-              "title": "❌ data_uploader failed",
-              "description": "Branch: **${{ github.ref_name }}**\nSee run logs for details.",
-              "url": "RUN_URL_PLACEHOLDER",
-              "timestamp": "NOW_PLACEHOLDER",
-              "color": 15158332
-            }]
-          }
+          {"username":"CFB Uploader","embeds":[{"title":"❌ data_uploader failed","description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":15158332}]}
           JSON
           )
           PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+
