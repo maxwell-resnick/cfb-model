@@ -1,9 +1,9 @@
-- name: Run uploader
+- name: data_uploader_daily
   env:
     BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
     DATABASE_URL: ${{ secrets.DATABASE_URL }}   # or the NEON_* ones your script expects
   run: python data_uploader.py
-  
+
 on:
   schedule:
     - cron: "10 13 * * *"   # 09:10 ET (cron uses UTC)
