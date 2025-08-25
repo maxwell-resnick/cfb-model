@@ -407,10 +407,16 @@ cols_to_keep_base = [
     "team","opponent","homeId","homeTeam","homeClassification","homeConference","homePoints",
     "awayId","awayTeam","awayClassification","awayConference","awayPoints",
     "talent","percentPPA","provider","min_spread","max_spread",
+    "offense_ppa", 
+    "offense_passingPlays.totalPPA","offense_passingPlays.ppa",
+    "offense_rushingPlays.totalPPA","offense_rushingPlays.ppa",
+    "home_field_indicator",
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
+    "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
 ]
+
 
 # reindex will add any missing base cols (as NA) and drop all non-base cols
 df2025      = df2025.reindex(columns=cols_to_keep_base)
@@ -668,12 +674,29 @@ engine = create_engine(
     connect_args={"ssl_context": ssl.create_default_context()},
 )
 
-# --- Ensure date_updated column exists (one-time, safe to re-run) ---
+def _pg_type_from_series(s: pd.Series) -> str:
+    # pick reasonable defaults; you can fine-tune as needed
+    if pd.api.types.is_integer_dtype(s.dtype):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(s.dtype):
+        return "DOUBLE PRECISION"
+    if pd.api.types.is_bool_dtype(s.dtype):
+        return "BOOLEAN"
+    # if you truly store timestamps as strings in startDate, leave TEXT;
+    # otherwise detect datetime and use TIMESTAMPTZ
+    if pd.api.types.is_datetime64_any_dtype(s.dtype):
+        return "TIMESTAMPTZ"
+    return "TEXT"
+
 with engine.begin() as conn:
-    conn.execute(text(
-        'ALTER TABLE "PreparedData" '
-        'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
-    ))
+    existing = {c["name"] for c in inspect(conn).get_columns(TABLE, schema="public")}
+    # columns we intend to persist (model_df’s current columns + date_updated)
+    desired = set(model_df.columns) | {"date_updated"}
+    missing = [c for c in desired if c not in existing]
+
+    for c in missing:
+        typ = _pg_type_from_series(model_df[c]) if c in model_df.columns else "TIMESTAMPTZ"
+        conn.execute(text(f'ALTER TABLE "{TABLE}" ADD COLUMN "{c}" {typ};'))
 
 with engine.connect() as conn:
     insp = inspect(conn)
