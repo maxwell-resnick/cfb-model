@@ -637,13 +637,43 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
         if not (cnt == 2).all():
             raise AssertionError("Two rows per game id required.")
 
+    # ---------- imputations ----------
+    # (recompute mask after merges to avoid index misalignment)
+    mask_1519_talent = df["season"].between(2015, 2019, inclusive="both")
+    avg_talent = df.loc[mask_1519_talent].groupby("team")["team_talent"].mean(numeric_only=True).rename("avg_talent_2015_2019")
+    df = df.merge(avg_talent, on="team", how="left")
+    df["team_talent"] = pd.to_numeric(df["team_talent"], errors="coerce")
+    df["team_talent"] = df["team_talent"].where(~df["team_talent"].isna(), df["avg_talent_2015_2019"])
+    df.drop(columns=["avg_talent_2015_2019"], inplace=True)
+
+    opp_talent_map = (df.groupby(["opponent","season"])["team_talent"]
+                        .mean(numeric_only=True)
+                        .rename("opponent_talent_imputed")
+                        .reset_index()
+                        .rename(columns={"opponent":"opponent_key"}))
+    df = df.merge(opp_talent_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
+    df["opponent_talent"] = pd.to_numeric(df["opponent_talent"], errors="coerce")
+    df["opponent_talent"] = df["opponent_talent"].where(~df["opponent_talent"].isna(), df["opponent_talent_imputed"])
+    df.drop(columns=["opponent_key","opponent_talent_imputed"], inplace=True)
+
+    mask_1519_pct = df["season"].between(2015, 2019, inclusive="both")
+    avg_pct = df.loc[mask_1519_pct].groupby("team")["team_percentPPA"].mean(numeric_only=True).rename("avg_percentPPA_2015_2019")
+    overall_pct = float(avg_pct.mean(skipna=True)) if not avg_pct.empty else np.nan
+    df = df.merge(avg_pct, on="team", how="left")
+    df["team_percentPPA"] = pd.to_numeric(df["team_percentPPA"], errors="coerce")
+    df["team_percentPPA"] = df["team_percentPPA"].where(~df["team_percentPPA"].isna(),
+                                                        df["avg_percentPPA_2015_2019"].fillna(overall_pct))
+    df.drop(columns=["avg_percentPPA_2015_2019"], inplace=True)
+
     opp_pct_map = (df.groupby(["opponent","season"])["team_percentPPA"]
                      .mean(numeric_only=True)
                      .rename("opponent_percentPPA_imputed")
                      .reset_index()
                      .rename(columns={"opponent":"opponent_key"}))
     df = df.merge(opp_pct_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
-
+    df["opponent_percentPPA"] = pd.to_numeric(df["opponent_percentPPA"], errors="coerce")
+    df["opponent_percentPPA"] = df["opponent_percentPPA"].where(~df["opponent_percentPPA"].isna(),
+                                                                df["opponent_percentPPA_imputed"].fillna(overall_pct))
     df.drop(columns=["opponent_key","opponent_percentPPA_imputed"], inplace=True)
 
     # final numeric hygiene
