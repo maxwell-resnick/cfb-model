@@ -414,7 +414,6 @@ cols_to_keep_base = [
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
-    "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
 ]
 
 
@@ -674,23 +673,26 @@ engine = create_engine(
     connect_args={"ssl_context": ssl.create_default_context()},
 )
 
-# ensure offense_PPA exists in the frame (your model uses offense_ppa internally)
+# keep column spelling consistent with your chosen name
 if "offense_ppa" in model_df.columns and "offense_PPA" not in model_df.columns:
     model_df = model_df.rename(columns={"offense_ppa": "offense_PPA"})
 
-# --- Ensure date_updated + ONLY the 6 requested columns exist (no other schema changes) ---
+# --- Ensure only needed columns exist (no other schema changes) ---
 with engine.begin() as conn:
     conn.execute(text(
         'ALTER TABLE "PreparedData" '
         'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
     ))
-    # 6 new columns
+    # 6 metrics
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_PPA" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_passingPlays.totalPPA" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_passingPlays.ppa" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_rushingPlays.totalPPA" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_rushingPlays.ppa" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "home_field_indicator" INTEGER;'))
+    # + team/opponent talent
+    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "team_talent" DOUBLE PRECISION;'))
+    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "opponent_talent" DOUBLE PRECISION;'))
 
 with engine.connect() as conn:
     insp = inspect(conn)
@@ -706,8 +708,8 @@ for k in KEYS:
 has_date_updated = "date_updated" in cols_in_db
 
 model_trim = model_df[common_cols].copy()
-db_trim    = (db_df[common_cols + (["date_updated"] if has_date_updated and "date_updated" not in common_cols else [])].copy()
-              if not db_df.empty else pd.DataFrame(columns=common_cols + (["date_updated"] if has_date_updated else [])))
+db_trim = (db_df[common_cols + (["date_updated"] if has_date_updated and "date_updated" not in common_cols else [])].copy()
+           if not db_df.empty else pd.DataFrame(columns=common_cols + (["date_updated"] if has_date_updated else [])))
 
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
@@ -716,9 +718,9 @@ DEFAULT_TEXT_COLS = [
 DEFAULT_DATE_COLS = ["startDate"]
 DEFAULT_NUM_COLS  = [
     "season","week","homePoints","awayPoints","talent","percentPPA","min_spread","max_spread",
-    "offense_PPA", "offense_passingPlays.totalPPA", "offense_passingPlays.ppa",
-    "offense_rushingPlays.totalPPA", "offense_rushingPlays.ppa", "home_field_indicator",
-    "team_talent", "opponent_talent",
+    "offense_PPA","offense_passingPlays.totalPPA","offense_passingPlays.ppa",
+    "offense_rushingPlays.totalPPA","offense_rushingPlays.ppa","home_field_indicator",
+    "team_talent","opponent_talent",
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
@@ -728,19 +730,13 @@ DEFAULT_NUM_COLS  = [
 
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     x = df_slice.copy()
-    # text: strip -> NA if empty
     for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
-        s = x[c]
-        m = s.notna()
-        s2 = s.where(~m, s[m].astype(str).str.strip()).replace("", pd.NA)
-        x[c] = s2
-    # dates: convert to epoch seconds (Int64) so tz/formatting don’t matter
+        s = x[c]; m = s.notna()
+        x[c] = s.where(~m, s[m].astype(str).str.strip()).replace("", pd.NA)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        epoch = (dt.view("int64") // 1_000_000_000)     # keep as-is to match your original
-        epoch = epoch.where(~dt.isna(), other=pd.NA).astype("Int64")
+        epoch = (dt.view("int64") // 1_000_000_000).where(~dt.isna(), other=pd.NA).astype("Int64")
         x[c] = epoch
-    # numerics: coerce + round
     for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
         x[c] = pd.to_numeric(x[c], errors="coerce").round(6)
     return x
@@ -748,25 +744,19 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
 model_idx = model_trim.set_index(KEYS, drop=False)
 db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
 
-# NEW rows
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
 
-# CHANGED rows (ignore date_updated when diffing!)
 changed_rows = pd.DataFrame(columns=common_cols)
 diff_summary = {}
-
 if not db_df.empty:
     common_index = model_idx.index.intersection(db_idx.index)
     if len(common_index):
-        nonkey_cols = [c for c in common_cols if c not in KEYS]
-        nonkey_cols = [c for c in nonkey_cols if c != "date_updated"]  # ignore timestamp column
+        nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
         modN = canon(model_idx.loc[common_index, nonkey_cols])
         dbN  = canon(db_idx.loc[common_index, nonkey_cols])
-
         eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
         diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
-        row_equal = eq.all(axis=1)
-        changed_keys = row_equal.index[~row_equal]
+        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
         if len(changed_keys):
             changed_rows = model_idx.loc[changed_keys, common_cols].copy()
 
@@ -777,21 +767,19 @@ if diff_summary:
     if nz:
         print("Changed cells by column:", nz)
 
-# UPSERT new + changed
 to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
 if to_upsert.empty:
     print("No new/changed rows to upsert.")
 else:
-    cols_for_insert = [c for c in common_cols if c != "date_updated"]  # let default set date_updated on INSERT
+    cols_for_insert = [c for c in common_cols if c != "date_updated"]
     update_cols = [c for c in cols_for_insert if c not in KEYS]
 
-    # SAFE placeholders for dotted names (e.g., offense_rushingPlays.ppa)
     def _param_name(col: str) -> str:
         return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
     param_map = {c: _param_name(c) for c in cols_for_insert}
 
-    cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)                 # quoted column names
-    vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)       # safe bind names
+    cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
+    vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
     set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
 
     upsert_sql = text(f'''
@@ -801,7 +789,6 @@ else:
         DO UPDATE SET {set_q};
     ''')
 
-    # build records using the SAFE bind names
     recs = []
     for _, row in to_upsert[cols_for_insert].iterrows():
         d = {}
