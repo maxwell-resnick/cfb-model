@@ -674,10 +674,6 @@ engine = create_engine(
     connect_args={"ssl_context": ssl.create_default_context()},
 )
 
-# keep column spelling consistent with your chosen name
-if "offense_ppa" in model_df.columns and "offense_PPA" not in model_df.columns:
-    model_df = model_df.rename(columns={"offense_ppa": "offense_PPA"})
-
 # ---- FAST PATH: limit to current season in-memory ----
 if "season" in model_df.columns:
     model_df = model_df[pd.to_numeric(model_df["season"], errors="coerce").eq(YEAR)].copy()
@@ -688,15 +684,6 @@ with engine.begin() as conn:
         'ALTER TABLE "PreparedData" '
         'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
     ))
-    # the 6 metrics + team/opponent talent
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_PPA" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_passingPlays.totalPPA" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_passingPlays.ppa" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_rushingPlays.totalPPA" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "offense_rushingPlays.ppa" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "home_field_indicator" INTEGER;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "team_talent" DOUBLE PRECISION;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "opponent_talent" DOUBLE PRECISION;'))
 
 # Columns we normalize/compare (same lists you’ve been using)
 DEFAULT_TEXT_COLS = [
@@ -706,7 +693,7 @@ DEFAULT_TEXT_COLS = [
 DEFAULT_DATE_COLS = ["startDate"]
 DEFAULT_NUM_COLS = [
     "season","week","homePoints","awayPoints","talent","percentPPA","min_spread","max_spread",
-    "offense_PPA","offense_passingPlays.totalPPA","offense_passingPlays.ppa",
+    "offense_ppa","offense_passingPlays.totalPPA","offense_passingPlays.ppa",
     "offense_rushingPlays.totalPPA","offense_rushingPlays.ppa","home_field_indicator",
     "team_talent","opponent_talent",
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
