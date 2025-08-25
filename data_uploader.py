@@ -718,6 +718,7 @@ DEFAULT_NUM_COLS  = [
     "season","week","homePoints","awayPoints","talent","percentPPA","min_spread","max_spread",
     "offense_PPA", "offense_passingPlays.totalPPA", "offense_passingPlays.ppa",
     "offense_rushingPlays.totalPPA", "offense_rushingPlays.ppa", "home_field_indicator",
+    "team_talent", "opponent_talent",
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
