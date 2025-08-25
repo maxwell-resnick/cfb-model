@@ -681,6 +681,35 @@ if "offense_ppa" in model_df.columns and "offense_PPA" not in model_df.columns:
 if "season" in model_df.columns:
     model_df = model_df[pd.to_numeric(model_df["season"], errors="coerce").eq(YEAR)].copy()
 
+# ---- Ensure team_talent / opponent_talent exist (and fill from 'talent' map if missing) ----
+if "team_talent" not in model_df.columns or model_df["team_talent"].isna().all():
+    if {"season", "team", "talent"}.issubset(model_df.columns):
+        tm = (
+            model_df[["season", "team", "talent"]]
+            .dropna(subset=["talent"])
+            .drop_duplicates(subset=["season", "team"])
+            .rename(columns={"talent": "team_talent"})
+        )
+        model_df = model_df.merge(tm, on=["season", "team"], how="left")
+    else:
+        model_df["team_talent"] = pd.NA
+
+if "opponent_talent" not in model_df.columns or model_df["opponent_talent"].isna().all():
+    if {"season", "opponent", "talent"}.issubset(model_df.columns):
+        om = (
+            model_df[["season", "team", "talent"]]
+            .dropna(subset=["talent"])
+            .drop_duplicates(subset=["season", "team"])
+            .rename(columns={"team": "opponent", "talent": "opponent_talent"})
+        )
+        model_df = model_df.merge(om, on=["season", "opponent"], how="left")
+    else:
+        model_df["opponent_talent"] = pd.NA
+
+# Optional: match your modeling fallback if desired (keeps runtime tiny)
+model_df["team_talent"] = pd.to_numeric(model_df["team_talent"], errors="coerce")
+model_df["opponent_talent"] = pd.to_numeric(model_df["opponent_talent"], errors="coerce")
+
 # --- Ensure ONLY the needed new columns exist (no other schema changes) ---
 with engine.begin() as conn:
     conn.execute(text(
@@ -697,7 +726,7 @@ with engine.begin() as conn:
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "team_talent" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "opponent_talent" DOUBLE PRECISION;'))
 
-# Columns we normalize/compare (same lists you’ve been using)
+# Columns we normalize/compare
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
     "homeConference","awayConference","homeClassification","awayClassification","provider"
@@ -729,7 +758,6 @@ has_date_updated = "date_updated" in cols_in_db
 
 # ---- FAST PATH: read only needed cols and only this season from DB ----
 read_cols = [c for c in common_cols if c in cols_in_db]
-# make sure we can filter by season in SQL
 if "season" not in read_cols and "season" in cols_in_db:
     read_cols.append("season")
 
@@ -742,7 +770,6 @@ with engine.connect() as conn:
             params={"yr": YEAR},
         )
     else:
-        # fallback: rare case season not present; read nothing to avoid full scan
         db_df = pd.DataFrame(columns=read_cols)
 
 # Align frames
