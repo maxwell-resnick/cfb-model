@@ -721,30 +721,95 @@ DEFAULT_TEXT_COLS = [
 DEFAULT_DATE_COLS = ["startDate"]
 DEFAULT_NUM_COLS  = [
     "season","week","homePoints","awayPoints","talent","percentPPA","min_spread","max_spread",
-    "offense_PPA", "offense_passingPlays.totalPPA", "offense_passingPlays.ppa", 
+    "offense_PPA", "offense_passingPlays.totalPPA", "offense_passingPlays.ppa",
     "offense_rushingPlays.totalPPA", "offense_rushingPlays.ppa", "home_field_indicator",
     "bovada_spread","bovada_opening_spread","bovada_overunder","bovada_opening_overunder",
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
-    "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
     "neutralSite","conferenceGame","homeId","awayId","id"
 ]
 
+WANTED = set(KEYS) | set(DEFAULT_TEXT_COLS) | set(DEFAULT_DATE_COLS) | set(DEFAULT_NUM_COLS) | {"date_updated"}
+
+# If your frame has offense_ppa, map it to offense_PPA (your chosen name)
+if "offense_ppa" in model_df.columns and "offense_PPA" not in model_df.columns:
+    model_df = model_df.rename(columns={"offense_ppa": "offense_PPA"})
+
+# Trim model_df to wanted (minus date_updated which DB fills)
+wanted_no_dtupd = [c for c in WANTED if c != "date_updated"]
+for c in wanted_no_dtupd:
+    if c not in model_df.columns:
+        model_df[c] = pd.NA
+model_df = model_df[wanted_no_dtupd].copy()
+
+# ---- Ensure DB has ONLY wanted cols (optionally prune extras) ----
+from sqlalchemy import inspect
+
+# type picker for new columns
+def _pg_type(col: str, s: pd.Series) -> str:
+    if col in DEFAULT_TEXT_COLS:
+        return "TEXT"
+    if col in DEFAULT_DATE_COLS:
+        return "TIMESTAMPTZ"
+    if col in DEFAULT_NUM_COLS:
+        # pick int-ish types for integer-ish cols
+        int_like = {"season","week","homePoints","awayPoints","neutralSite","conferenceGame","homeId","awayId","id","home_field_indicator"}
+        return "BIGINT" if col in int_like else "DOUBLE PRECISION"
+    if col == "date_updated":
+        return "TIMESTAMPTZ"
+    return "TEXT"
+
+with engine.begin() as conn:
+    insp = inspect(conn)
+    existing = {c["name"] for c in insp.get_columns(TABLE, schema="public")}
+
+    # add missing wanted cols
+    to_add = [c for c in WANTED if c not in existing]
+    for c in to_add:
+        pgtype = _pg_type(c, model_df[c]) if c in model_df.columns else "TIMESTAMPTZ"
+        if c == "date_updated":
+            conn.execute(text(
+                f'ALTER TABLE "{TABLE}" ADD COLUMN IF NOT EXISTS "date_updated" TIMESTAMPTZ NOT NULL DEFAULT now();'
+            ))
+        else:
+            conn.execute(text(f'ALTER TABLE "{TABLE}" ADD COLUMN "{c}" {pgtype};'))
+
+    # (Optional) drop extras not in allowlist (be careful in prod)
+    PRUNE = True  # set False if you prefer to leave extras alone
+    if PRUNE:
+        # don’t drop PK columns or date_updated
+        extras = [c for c in existing if c not in WANTED and c not in KEYS]
+        for c in extras:
+            conn.execute(text(f'ALTER TABLE "{TABLE}" DROP COLUMN "{c}";'))
+
+# ------------------------------
+# Diff vs DB using only wanted cols (ignore date_updated)
+# ------------------------------
+with engine.connect() as conn:
+    db_df = pd.read_sql(text(f'SELECT * FROM "{TABLE}"'), conn)
+
+common_cols = [c for c in wanted_no_dtupd if c in db_df.columns]  # intersect with DB
+for k in KEYS:
+    if k not in common_cols:
+        common_cols.append(k)
+
+model_trim = model_df[common_cols].copy()
+db_trim    = db_df[common_cols].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
+
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     x = df_slice.copy()
-    # text: strip -> NA if empty
+    # strip text
     for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
         s = x[c]
         m = s.notna()
-        s2 = s.where(~m, s[m].astype(str).str.strip()).replace("", pd.NA)
-        x[c] = s2
-    # dates: convert to epoch seconds (Int64) so tz/formatting don’t matter
+        x[c] = s.where(~m, s[m].astype(str).str.strip()).replace("", pd.NA)
+    # dates -> epoch seconds
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
         epoch = (dt.view("int64") // 1_000_000_000)
         epoch = epoch.where(~dt.isna(), other=pd.NA).astype("Int64")
         x[c] = epoch
-    # numerics: coerce + round
+    # numerics
     for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
         x[c] = pd.to_numeric(x[c], errors="coerce").round(6)
     return x
@@ -752,28 +817,19 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
 model_idx = model_trim.set_index(KEYS, drop=False)
 db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
 
-# NEW rows
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
 
-# CHANGED rows (ignore date_updated when diffing!)
 changed_rows = pd.DataFrame(columns=common_cols)
 diff_summary = {}
-
 if not db_df.empty:
     common_index = model_idx.index.intersection(db_idx.index)
     if len(common_index):
-        nonkey_cols = [c for c in common_cols if c not in KEYS]
-        # explicitly drop date_updated from comparison if present
-        nonkey_cols = [c for c in nonkey_cols if c != "date_updated"]
-
-        modN = canon(model_idx.loc[common_index, nonkey_cols])
-        dbN  = canon(db_idx.loc[common_index, nonkey_cols])
-
+        nonkeys = [c for c in common_cols if c not in KEYS]  # date_updated already excluded
+        modN = canon(model_idx.loc[common_index, nonkeys])
+        dbN  = canon(db_idx.loc[common_index, nonkeys])
         eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
         diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
-
-        row_equal = eq.all(axis=1)
-        changed_keys = row_equal.index[~row_equal]
+        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
         if len(changed_keys):
             changed_rows = model_idx.loc[changed_keys, common_cols].copy()
 
@@ -782,24 +838,21 @@ print(f"CHANGED rows (after normalization): {len(changed_rows)}")
 if diff_summary:
     nz = {k:v for k,v in diff_summary.items() if v}
     if nz:
-        print("Changed cells by column:", nz)
+        print("Changed cells by column (non-zero only):", nz)
 
-# UPSERT new + changed
+# ------------------------------
+# Upsert only allowlisted cols
+# ------------------------------
 to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
 if to_upsert.empty:
     print("No new/changed rows to upsert.")
 else:
-    # Build INSERT column list without date_updated; let default handle inserts
-    cols_for_insert = [c for c in common_cols if c != "date_updated"]
-    update_cols = [c for c in cols_for_insert if c not in KEYS]  # non-keys only
+    cols_for_insert = common_cols  # already excludes date_updated
+    update_cols = [c for c in cols_for_insert if c not in KEYS]
 
     cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
     vals_n = ", ".join(f':{c}' for c in cols_for_insert)
-
-    # Always bump date_updated on updates; if nothing else changed, we won't be upserting this row anyway
-    set_parts = [f'"{c}" = EXCLUDED."{c}"' for c in update_cols]
-    set_parts.append('date_updated = now()')
-    set_q = ", ".join(set_parts)
+    set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
 
     upsert_sql = text(f'''
         INSERT INTO "{TABLE}" ({cols_q})
@@ -808,7 +861,7 @@ else:
         DO UPDATE SET {set_q};
     ''')
 
-    recs = to_upsert[cols_for_insert].where(pd.notna(to_upsert[cols_for_insert]), None).to_dict(orient="records")
+    recs = to_upsert.where(pd.notna(to_upsert), None).to_dict(orient="records")
     CHUNK = 500
     with engine.begin() as conn:
         for i in range(0, len(recs), CHUNK):
