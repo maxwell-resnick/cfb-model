@@ -637,43 +637,13 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
         if not (cnt == 2).all():
             raise AssertionError("Two rows per game id required.")
 
-    # ---------- imputations ----------
-    # (recompute mask after merges to avoid index misalignment)
-    mask_1519_talent = df["season"].between(2015, 2019, inclusive="both")
-    avg_talent = df.loc[mask_1519_talent].groupby("team")["team_talent"].mean(numeric_only=True).rename("avg_talent_2015_2019")
-    df = df.merge(avg_talent, on="team", how="left")
-    df["team_talent"] = pd.to_numeric(df["team_talent"], errors="coerce")
-    df["team_talent"] = df["team_talent"].where(~df["team_talent"].isna(), df["avg_talent_2015_2019"])
-    df.drop(columns=["avg_talent_2015_2019"], inplace=True)
-
-    opp_talent_map = (df.groupby(["opponent","season"])["team_talent"]
-                        .mean(numeric_only=True)
-                        .rename("opponent_talent_imputed")
-                        .reset_index()
-                        .rename(columns={"opponent":"opponent_key"}))
-    df = df.merge(opp_talent_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
-    df["opponent_talent"] = pd.to_numeric(df["opponent_talent"], errors="coerce")
-    df["opponent_talent"] = df["opponent_talent"].where(~df["opponent_talent"].isna(), df["opponent_talent_imputed"])
-    df.drop(columns=["opponent_key","opponent_talent_imputed"], inplace=True)
-
-    mask_1519_pct = df["season"].between(2015, 2019, inclusive="both")
-    avg_pct = df.loc[mask_1519_pct].groupby("team")["team_percentPPA"].mean(numeric_only=True).rename("avg_percentPPA_2015_2019")
-    overall_pct = float(avg_pct.mean(skipna=True)) if not avg_pct.empty else np.nan
-    df = df.merge(avg_pct, on="team", how="left")
-    df["team_percentPPA"] = pd.to_numeric(df["team_percentPPA"], errors="coerce")
-    df["team_percentPPA"] = df["team_percentPPA"].where(~df["team_percentPPA"].isna(),
-                                                        df["avg_percentPPA_2015_2019"].fillna(overall_pct))
-    df.drop(columns=["avg_percentPPA_2015_2019"], inplace=True)
-
     opp_pct_map = (df.groupby(["opponent","season"])["team_percentPPA"]
                      .mean(numeric_only=True)
                      .rename("opponent_percentPPA_imputed")
                      .reset_index()
                      .rename(columns={"opponent":"opponent_key"}))
     df = df.merge(opp_pct_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
-    df["opponent_percentPPA"] = pd.to_numeric(df["opponent_percentPPA"], errors="coerce")
-    df["opponent_percentPPA"] = df["opponent_percentPPA"].where(~df["opponent_percentPPA"].isna(),
-                                                                df["opponent_percentPPA_imputed"].fillna(overall_pct))
+
     df.drop(columns=["opponent_key","opponent_percentPPA_imputed"], inplace=True)
 
     # final numeric hygiene
@@ -691,12 +661,13 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 model_df = build_model_data(combined_df)
 
 TABLE = "PreparedData"
-KEYS  = ["id", "team", "opponent"]
+KEYS = ["id", "team", "opponent"]
 
 DATABASE_URL = (
     "postgresql+pg8000://neondb_owner:npg_1d0oXImKqyJv"
     "@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb"
 )
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -710,35 +681,6 @@ if "offense_ppa" in model_df.columns and "offense_PPA" not in model_df.columns:
 # ---- FAST PATH: limit to current season in-memory ----
 if "season" in model_df.columns:
     model_df = model_df[pd.to_numeric(model_df["season"], errors="coerce").eq(YEAR)].copy()
-
-# ---- Ensure team_talent / opponent_talent exist (and fill from 'talent' map if missing) ----
-if "team_talent" not in model_df.columns or model_df["team_talent"].isna().all():
-    if {"season", "team", "talent"}.issubset(model_df.columns):
-        tm = (
-            model_df[["season", "team", "talent"]]
-            .dropna(subset=["talent"])
-            .drop_duplicates(subset=["season", "team"])
-            .rename(columns={"talent": "team_talent"})
-        )
-        model_df = model_df.merge(tm, on=["season", "team"], how="left")
-    else:
-        model_df["team_talent"] = pd.NA
-
-if "opponent_talent" not in model_df.columns or model_df["opponent_talent"].isna().all():
-    if {"season", "opponent", "talent"}.issubset(model_df.columns):
-        om = (
-            model_df[["season", "team", "talent"]]
-            .dropna(subset=["talent"])
-            .drop_duplicates(subset=["season", "team"])
-            .rename(columns={"team": "opponent", "talent": "opponent_talent"})
-        )
-        model_df = model_df.merge(om, on=["season", "opponent"], how="left")
-    else:
-        model_df["opponent_talent"] = pd.NA
-
-# Optional: match your modeling fallback if desired (keeps runtime tiny)
-model_df["team_talent"] = pd.to_numeric(model_df["team_talent"], errors="coerce")
-model_df["opponent_talent"] = pd.to_numeric(model_df["opponent_talent"], errors="coerce")
 
 # --- Ensure ONLY the needed new columns exist (no other schema changes) ---
 with engine.begin() as conn:
@@ -756,13 +698,13 @@ with engine.begin() as conn:
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "team_talent" DOUBLE PRECISION;'))
     conn.execute(text('ALTER TABLE "PreparedData" ADD COLUMN IF NOT EXISTS "opponent_talent" DOUBLE PRECISION;'))
 
-# Columns we normalize/compare
+# Columns we normalize/compare (same lists you’ve been using)
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
     "homeConference","awayConference","homeClassification","awayClassification","provider"
 ]
 DEFAULT_DATE_COLS = ["startDate"]
-DEFAULT_NUM_COLS  = [
+DEFAULT_NUM_COLS = [
     "season","week","homePoints","awayPoints","talent","percentPPA","min_spread","max_spread",
     "offense_PPA","offense_passingPlays.totalPPA","offense_passingPlays.ppa",
     "offense_rushingPlays.totalPPA","offense_rushingPlays.ppa","home_field_indicator",
@@ -788,6 +730,7 @@ has_date_updated = "date_updated" in cols_in_db
 
 # ---- FAST PATH: read only needed cols and only this season from DB ----
 read_cols = [c for c in common_cols if c in cols_in_db]
+# make sure we can filter by season in SQL
 if "season" not in read_cols and "season" in cols_in_db:
     read_cols.append("season")
 
@@ -800,11 +743,12 @@ with engine.connect() as conn:
             params={"yr": YEAR},
         )
     else:
+        # fallback: rare case season not present; read nothing to avoid full scan
         db_df = pd.DataFrame(columns=read_cols)
 
 # Align frames
 model_trim = model_df[common_cols].copy()
-db_trim    = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
+db_trim = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
 
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     x = df_slice.copy()
@@ -815,7 +759,7 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     # dates: convert to epoch seconds (match your original behavior)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        epoch = (dt.view("int64") // 1_000_000_000)  # keep view() to mirror prior diffs
+        epoch = (dt.view("int64") // 1_000_000_000)
         epoch = epoch.where(~dt.isna(), other=pd.NA).astype("Int64")
         x[c] = epoch
     # numerics: coerce + round
@@ -824,7 +768,7 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     return x
 
 model_idx = model_trim.set_index(KEYS, drop=False)
-db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
+db_idx = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
 
 # NEW rows
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
@@ -837,7 +781,7 @@ if not db_trim.empty and not model_trim.empty:
     if len(common_index):
         nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
         modN = canon(model_idx.loc[common_index, nonkey_cols])
-        dbN  = canon(db_idx.loc[common_index, nonkey_cols])
+        dbN = canon(db_idx.loc[common_index, nonkey_cols])
         eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
         diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
         changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
@@ -865,13 +809,13 @@ else:
     param_map = {c: _param_name(c) for c in cols_for_insert}
     cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
     vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
-    set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
+    set_q = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
 
     upsert_sql = text(f'''
         INSERT INTO "{TABLE}" ({cols_q})
         VALUES ({vals_q})
-        ON CONFLICT ("id","team","opponent")
-        DO UPDATE SET {set_q};
+        ON CONFLICT ("id","team","opponent") DO UPDATE
+        SET {set_q};
     ''')
 
     recs = []
@@ -886,4 +830,5 @@ else:
     with engine.begin() as conn:
         for i in range(0, len(recs), CHUNK):
             conn.execute(upsert_sql, recs[i:i+CHUNK])
+
     print(f"Upserted rows: {len(to_upsert)}")
