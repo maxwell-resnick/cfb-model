@@ -661,31 +661,31 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 model_df = build_model_data(combined_df)
 
 TABLE = "PreparedData"
-KEYS = ["id", "team", "opponent"]
+KEYS  = ["id", "team", "opponent"]
 
 DATABASE_URL = (
     "postgresql+pg8000://neondb_owner:npg_1d0oXImKqyJv"
     "@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb"
 )
 
+# model_df must already exist at this point
+# model_df = build_model_data(combined_df)
+
+# ---------- CONNECT ----------
 engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    connect_args={"ssl_context": ssl.create_default_context()},
+   DATABASE_URL,
+   pool_pre_ping=True,
+   connect_args={"ssl_context": ssl.create_default_context()},
 )
 
-# ---- FAST PATH: limit to current season in-memory ----
-if "season" in model_df.columns:
-    model_df = model_df[pd.to_numeric(model_df["season"], errors="coerce").eq(YEAR)].copy()
-
-# --- Ensure ONLY the needed new columns exist (no other schema changes) ---
+# ---------- OPTIONAL: ensure helper stamp column exists ----------
 with engine.begin() as conn:
     conn.execute(text(
         'ALTER TABLE "PreparedData" '
         'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
     ))
 
-# Columns we normalize/compare (same lists you’ve been using)
+# ---------- Canonicalization rules (stable diffs) ----------
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
     "homeConference","awayConference","homeClassification","awayClassification","provider"
@@ -703,73 +703,69 @@ DEFAULT_NUM_COLS = [
     "neutralSite","conferenceGame","homeId","awayId","id"
 ]
 
-with engine.connect() as conn:
-    insp = inspect(conn)
-    cols_in_db = {c["name"] for c in insp.get_columns(TABLE, schema="public")}
+def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
+    x = df_slice.copy()
 
-# Work only with columns present both in model & DB
+    # TEXT: trim, turn empty -> NA
+    for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
+        # cast to pandas "string" dtype so .str ops are vectorized and NA-safe
+        s = x[c].astype("string")
+        s = s.str.strip()
+        x[c] = s.replace({"": pd.NA})
+
+    # DATES: to UTC, then epoch seconds (Int64, NA-preserving)
+    for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
+        dt = pd.to_datetime(x[c], errors="coerce", utc=True)
+        # pandas 2.x-safe int extraction
+        epoch = (dt.view("int64") // 1_000_000_000)
+        x[c] = pd.Series(epoch).astype("Int64")
+
+    # NUMERICS: coerce + round for stable diffs
+    for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
+        x[c] = pd.to_numeric(x[c], errors="coerce").round(6)
+
+    return x
+
+# ---------- 1) Discover DB columns & choose common cols ----------
+with engine.connect() as conn:
+    cols_in_db = {c["name"] for c in inspect(conn).get_columns(TABLE, schema="public")}
+
+# Only work with intersection to avoid schema drift
 common_cols = [c for c in model_df.columns if c in cols_in_db]
 for k in KEYS:
     if k not in common_cols:
         common_cols.append(k)
 
-has_date_updated = "date_updated" in cols_in_db
-
-# ---- FAST PATH: read only needed cols and only this season from DB ----
+# ---------- 2) Read ALL rows from DB for those columns ----------
 read_cols = [c for c in common_cols if c in cols_in_db]
-# make sure we can filter by season in SQL
-if "season" not in read_cols and "season" in cols_in_db:
-    read_cols.append("season")
+cols_sql  = ", ".join(f'"{c}"' for c in read_cols)
 
-cols_sql = ", ".join(f'"{c}"' for c in read_cols)
 with engine.connect() as conn:
-    if "season" in cols_in_db:
-        db_df = pd.read_sql(
-            text(f'SELECT {cols_sql} FROM "{TABLE}" WHERE "season" = :yr'),
-            conn,
-            params={"yr": YEAR},
-        )
-    else:
-        # fallback: rare case season not present; read nothing to avoid full scan
-        db_df = pd.DataFrame(columns=read_cols)
+    db_df = pd.read_sql(text(f'SELECT {cols_sql} FROM "{TABLE}"'), conn)
 
-# Align frames
+# ---------- 3) Align frames ----------
 model_trim = model_df[common_cols].copy()
-db_trim = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
+db_trim    = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
 
-def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
-    x = df_slice.copy()
-    # text: strip -> NA if empty
-    for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
-        s = x[c]; m = s.notna()
-        x[c] = s.where(~m, s[m].astype(str).str.strip()).replace("", pd.NA)
-    # dates: convert to epoch seconds (match your original behavior)
-    for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
-        dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        epoch = (dt.view("int64") // 1_000_000_000)
-        epoch = epoch.where(~dt.isna(), other=pd.NA).astype("Int64")
-        x[c] = epoch
-    # numerics: coerce + round
-    for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
-        x[c] = pd.to_numeric(x[c], errors="coerce").round(6)
-    return x
-
+# Index by composite key
 model_idx = model_trim.set_index(KEYS, drop=False)
-db_idx = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
+db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
 
-# NEW rows
+# ---------- 4) Detect NEW rows ----------
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
 
-# CHANGED rows (ignore date_updated)
+# ---------- 5) Detect CHANGED rows (canonical comparison, ignore date_updated) ----------
 changed_rows = pd.DataFrame(columns=common_cols)
 diff_summary = {}
+
 if not db_trim.empty and not model_trim.empty:
     common_index = model_idx.index.intersection(db_idx.index)
     if len(common_index):
         nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
         modN = canon(model_idx.loc[common_index, nonkey_cols])
-        dbN = canon(db_idx.loc[common_index, nonkey_cols])
-        eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
+        dbN  = canon(db_idx.loc[common_index, nonkey_cols])
+        eq   = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
+
         diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
         changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
         if len(changed_keys):
@@ -778,25 +774,27 @@ if not db_trim.empty and not model_trim.empty:
 print(f"NEW rows: {len(new_rows)}")
 print(f"CHANGED rows (after normalization): {len(changed_rows)}")
 if diff_summary:
-    nz = {k:v for k,v in diff_summary.items() if v}
+    nz = {k: v for k, v in diff_summary.items() if v}
     if nz:
         print("Changed cells by column (non-zero only):", nz)
 
-# UPSERT new + changed
+# ---------- 6) UPSERT (INSERT new + UPDATE changed) ----------
 to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
+
 if to_upsert.empty:
     print("No new/changed rows to upsert.")
 else:
-    cols_for_insert = [c for c in common_cols if c != "date_updated"]  # DB default on INSERT
-    update_cols = [c for c in cols_for_insert if c not in KEYS]
+    cols_for_insert = [c for c in common_cols if c != "date_updated"]  # let DB default on INSERT
+    update_cols     = [c for c in cols_for_insert if c not in KEYS]
 
     def _param_name(col: str) -> str:
-        return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)  # safe for dotted names
+        # safe param names for dotted columns
+        return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
 
     param_map = {c: _param_name(c) for c in cols_for_insert}
     cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
     vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
-    set_q = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
+    set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
 
     upsert_sql = text(f'''
         INSERT INTO "{TABLE}" ({cols_q})
@@ -819,3 +817,30 @@ else:
             conn.execute(upsert_sql, recs[i:i+CHUNK])
 
     print(f"Upserted rows: {len(to_upsert)}")
+
+# ---------- 7) (Optional) Ensure PK exists on (id, team, opponent) ----------
+with engine.begin() as conn:
+    # add NOT NULLs first (safe if already set)
+    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "id"       SET NOT NULL;'))
+    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "team"     SET NOT NULL;'))
+    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "opponent" SET NOT NULL;'))
+
+    # create PK if missing
+    conn.execute(text('''
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE t.relname = 'PreparedData'
+          AND n.nspname = 'public'
+          AND c.contype = 'p'
+      ) THEN
+        ALTER TABLE "PreparedData"
+        ADD CONSTRAINT prepareddata_pk PRIMARY KEY ("id","team","opponent");
+      END IF;
+    END$$;
+    '''))
+
+print("Sync complete.")
