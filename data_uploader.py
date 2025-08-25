@@ -742,9 +742,6 @@ for c in wanted_no_dtupd:
         model_df[c] = pd.NA
 model_df = model_df[wanted_no_dtupd].copy()
 
-# ---- Ensure DB has ONLY wanted cols (optionally prune extras) ----
-from sqlalchemy import inspect
-
 # type picker for new columns
 def _pg_type(col: str, s: pd.Series) -> str:
     if col in DEFAULT_TEXT_COLS:
@@ -844,24 +841,41 @@ if diff_summary:
 # Upsert only allowlisted cols
 # ------------------------------
 to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
+
 if to_upsert.empty:
     print("No new/changed rows to upsert.")
 else:
     cols_for_insert = common_cols  # already excludes date_updated
     update_cols = [c for c in cols_for_insert if c not in KEYS]
 
+    def _param_name(col: str) -> str:
+        # make a bind name that SQLAlchemy likes
+        return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
+
+    param_map = {c: _param_name(c) for c in cols_for_insert}
+
+    # quoted SQL column names, but safe placeholders
     cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
-    vals_n = ", ".join(f':{c}' for c in cols_for_insert)
+    vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
+
     set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
 
     upsert_sql = text(f'''
         INSERT INTO "{TABLE}" ({cols_q})
-        VALUES ({vals_n})
+        VALUES ({vals_q})
         ON CONFLICT ("id","team","opponent")
         DO UPDATE SET {set_q};
     ''')
 
-    recs = to_upsert.where(pd.notna(to_upsert), None).to_dict(orient="records")
+    # build records using the SAFE bind names
+    recs = []
+    for _, row in to_upsert[cols_for_insert].iterrows():
+        d = {}
+        for c in cols_for_insert:
+            v = row[c]
+            d[param_map[c]] = None if pd.isna(v) else v
+        recs.append(d)
+
     CHUNK = 500
     with engine.begin() as conn:
         for i in range(0, len(recs), CHUNK):
