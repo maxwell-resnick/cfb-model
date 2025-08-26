@@ -426,6 +426,8 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     """
     Pandas port of your R cleaning pipeline (keeps played + unplayed games).
     Returns a modeling DataFrame; advanced-stat fields remain NA when unavailable.
+
+    NOTE: This version keeps ONLY FBS vs FBS games (drops any game where either side is not exactly 'fbs').
     """
     df = final_df.copy()
 
@@ -433,7 +435,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     if "opponent" not in df.columns:
         df["opponent"] = np.nan
 
-    # base filter (same as before)
+    # base filter (exclude spring)
     df = df[(df["seasonType"].isna()) | (df["seasonType"] != "spring_regular")].copy()
 
     # is_home
@@ -527,13 +529,11 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df["team_season"]     = df["team"].astype(str) + ":" + df["season"].astype(str)
     df["opponent_season"] = df["opponent"].astype(str) + ":" + df["season"].astype(str)
 
-    # ---------------------------
     # KEEP ALL rows (played + unplayed) and tag them
-    # ---------------------------
     df["played"] = df["homePoints"].notna() & df["awayPoints"].notna()
     df["has_metrics"] = df["offense_ppa"].notna()
 
-    # Still ensure each game id appears exactly twice (home/away rows)
+    # Ensure each game id appears exactly twice (home/away rows)
     if "id" in df.columns:
         cnt = df.groupby("id").size()
         if not (cnt == 2).all():
@@ -548,9 +548,12 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["offense_ppa_scaled"] = np.nan
 
-    # FCS flags
-    df["team_fcs"]     = (df["team_classification"] == "fcs").astype(int)
-    df["opponent_fcs"] = (df["opponent_classification"] == "fcs").astype(int)
+    # ---------------------------
+    # KEEP ONLY FBS vs FBS games
+    # ---------------------------
+    cls_team = df["team_classification"].astype("string").str.strip().str.lower()
+    cls_opp  = df["opponent_classification"].astype("string").str.strip().str.lower()
+    df = df[cls_team.eq("fbs") & cls_opp.eq("fbs")].copy()
 
     # points and score diff
     df["team_points"]     = pd.to_numeric(df["homePoints"].where(df["is_home"].eq(1), df["awayPoints"]), errors="coerce")
@@ -576,7 +579,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     # weeks (nullable int)
     df["week"] = pd.to_numeric(df.get("week"), errors="coerce").astype("Int64")
 
-    # postseason renumbering (unchanged)
+    # postseason renumbering
     post = df[df["seasonType"] == "postseason"].copy()
     if not post.empty:
         post = post.sort_values(["team","season","startDate"])
@@ -617,10 +620,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     hfi.loc[(df["neutralSite"].eq(0)) & (df["is_home"].eq(0))] = -1
     df["home_field_indicator"] = hfi.astype("Int64")
 
-    # drop FCS vs FCS (unchanged)
-    df = df[(df["team_fcs"] == 0) & (df["opponent_fcs"] == 0)].copy()
-
-    # indices & integrity
+    # indices & integrity (after FBS-only filter)
     teams = sorted(pd.unique(pd.concat([df["team"], df["opponent"]], ignore_index=True).dropna()))
     idx_map = {t:i+1 for i,t in enumerate(teams)}
     df["team_idx"]     = pd.Series(df["team"].map(idx_map), index=df.index).astype("Int64")
@@ -629,9 +629,11 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     if "id" in df.columns:
         cnt = df.groupby("id").size()
         if not (cnt == 2).all():
-            raise AssertionError("Two rows per game id required.")
+            # It's okay if non-FBS games were removed entirely,
+            # but every remaining id must still have exactly two rows.
+            raise AssertionError("After FBS-only filter, each remaining game id must have two rows.")
 
-    # opponent percentPPA imputation scaffold (unchanged, but removed writeback)
+    # opponent percentPPA imputation scaffold (kept but not applied)
     opp_pct_map = (df.groupby(["opponent","season"])["team_percentPPA"]
                      .mean(numeric_only=True)
                      .rename("opponent_percentPPA_imputed")
