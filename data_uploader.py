@@ -754,7 +754,6 @@ db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_tri
 # ---------- 4) Detect NEW rows ----------
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
 
-# ---------- 5) Detect CHANGED rows (canonical comparison, ignore date_updated) ----------
 changed_rows = pd.DataFrame(columns=common_cols)
 diff_summary = {}
 
@@ -764,10 +763,22 @@ if not db_trim.empty and not model_trim.empty:
         nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
         modN = canon(model_idx.loc[common_index, nonkey_cols])
         dbN  = canon(db_idx.loc[common_index, nonkey_cols])
-        eq   = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
 
-        diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
-        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
+        # cell-wise equality (after canon)
+        eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
+
+        # --- count changes by column, excluding ignored columns (e.g., startDate)
+        diff_summary = {c: int((~eq[c]).sum())
+                        for c in modN.columns
+                        if c not in IGNORE_FOR_DIFF}
+
+        # --- treat ignored columns as equal so startDate-only diffs don't flag a row
+        eq_ignore = eq.copy()
+        for c in (set(IGNORE_FOR_DIFF) & set(eq.columns)):
+            eq_ignore[c] = True
+
+        # rows changed in at least one NON-ignored column
+        changed_keys = eq_ignore.all(axis=1).index[~eq_ignore.all(axis=1)]
         if len(changed_keys):
             changed_rows = model_idx.loc[changed_keys, common_cols].copy()
 
