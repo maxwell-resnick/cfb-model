@@ -642,12 +642,6 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(opp_pct_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
     df.drop(columns=["opponent_key","opponent_percentPPA_imputed"], inplace=True)
 
-    # final numeric hygiene
-    for c in ["team_talent","opponent_talent"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(250.0)
-    for c in ["team_percentPPA","opponent_percentPPA"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
     # robust within-season ordering + dense week rank
     df = df.sort_values(["season","start_dt"])
     df["week_in_season"] = df.groupby("season")["week"].transform(lambda s: s.rank(method="dense")).astype("Int64")
