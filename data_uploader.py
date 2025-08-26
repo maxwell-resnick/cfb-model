@@ -424,15 +424,8 @@ combined_df = combined_df.reindex(columns=cols_to_keep_base)
 
 def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Pandas port of your R cleaning pipeline (fixed for all pandas nullable Int64 issues).
-    Expects columns such as:
-      team, opponent (optional), seasonType, homeTeam, awayTeam, homeId, awayId,
-      homeClassification, awayClassification, homeConference, awayConference,
-      homePoints, awayPoints, startDate, season, talent, percentPPA,
-      conferenceGame, neutralSite, offense_ppa, offense_passingPlays.ppa, offense_rushingPlays.ppa,
-      week, id (optional), bovada_spread, bovada_opening_spread, bovada_overunder,
-      bovada_opening_overunder, consensus_spread.
-    Returns: model_data DataFrame.
+    Pandas port of your R cleaning pipeline (keeps played + unplayed games).
+    Returns a modeling DataFrame; advanced-stat fields remain NA when unavailable.
     """
     df = final_df.copy()
 
@@ -440,18 +433,17 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     if "opponent" not in df.columns:
         df["opponent"] = np.nan
 
-    # base filter
+    # base filter (same as before)
     df = df[(df["seasonType"].isna()) | (df["seasonType"] != "spring_regular")].copy()
 
-    # normalize names for home/away comparison
+    # is_home
     def _norm(series):
         out = series.astype(str).str.strip().str.lower()
         return out.mask(out.isin(["nan", "none", "null"]), np.nan)
 
-    # is_home as pandas nullable int
     df["is_home"] = (_norm(df["team"]) == _norm(df["homeTeam"])).astype("Int64")
 
-    # ids and classifications (use Series.where to preserve pandas dtypes)
+    # ids and classifications
     df["homeId"] = pd.to_numeric(df.get("homeId"), errors="coerce")
     df["awayId"] = pd.to_numeric(df.get("awayId"), errors="coerce")
     df["team_id"]     = df["homeId"].where(df["is_home"].eq(1), df["awayId"]).astype("Int64")
@@ -463,8 +455,10 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df["opponent_conference"]     = df["awayConference"].where(df["is_home"].eq(1),    df["homeConference"])
 
     # opponent fallback
-    df["opponent"] = df["opponent"].where(~(df["opponent"].isna() | (df["opponent"].astype(str).str.len() == 0)),
-                                          df["awayTeam"].where(df["is_home"].eq(1), df["homeTeam"]))
+    df["opponent"] = df["opponent"].where(
+        ~(df["opponent"].isna() | (df["opponent"].astype(str).str.len() == 0)),
+        df["awayTeam"].where(df["is_home"].eq(1), df["homeTeam"])
+    )
 
     # times
     df["start_dt"] = pd.to_datetime(df["startDate"], errors="coerce", utc=True)
@@ -504,7 +498,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(percent_map.rename(columns={"team":"opponent","percentPPA":"opponent_percentPPA"}),
                   on=["season","opponent"], how="left")
 
-    # bool-ish columns -> 0/1 ints (stay in pandas)
+    # boolean-ish -> ints
     if "conferenceGame" in df.columns:
         cg = df["conferenceGame"]
         if cg.dtype == bool:
@@ -522,7 +516,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["neutralSite"] = 0
 
-    # modeling frame ordering
+    # ordering + indices
     df = df.sort_values(["season","team","start_dt"])
     df["week_index"]       = df.groupby(["season","team"]).cumcount() + 1
     df["team_game_number"] = df["week_index"]
@@ -533,19 +527,19 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df["team_season"]     = df["team"].astype(str) + ":" + df["season"].astype(str)
     df["opponent_season"] = df["opponent"].astype(str) + ":" + df["season"].astype(str)
 
-    # filters like R
-    keep = (
-        df.groupby("team_season")["week_index"].transform("nunique") >= 2
-    ) & (
-        df.groupby("team")["season"].transform("nunique") >= 2
-    )
-    df = df[keep].copy()
-    if "offense_ppa" in df.columns:
-        df = df[~df["offense_ppa"].isna()].copy()
-    if "id" in df.columns:
-        df = df[df.groupby("id")["id"].transform("size") >= 2].copy()
+    # ---------------------------
+    # KEEP ALL rows (played + unplayed) and tag them
+    # ---------------------------
+    df["played"] = df["homePoints"].notna() & df["awayPoints"].notna()
+    df["has_metrics"] = df["offense_ppa"].notna()
 
-    # scale within-season
+    # Still ensure each game id appears exactly twice (home/away rows)
+    if "id" in df.columns:
+        cnt = df.groupby("id").size()
+        if not (cnt == 2).all():
+            raise AssertionError("Two rows per game id required.")
+
+    # scale within-season (NA-safe)
     if "offense_ppa" in df.columns:
         df["offense_ppa_scaled"] = (
             df.groupby("season")["offense_ppa"]
@@ -558,7 +552,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     df["team_fcs"]     = (df["team_classification"] == "fcs").astype(int)
     df["opponent_fcs"] = (df["opponent_classification"] == "fcs").astype(int)
 
-    # points and score diff (use Series.where, not np.where)
+    # points and score diff
     df["team_points"]     = pd.to_numeric(df["homePoints"].where(df["is_home"].eq(1), df["awayPoints"]), errors="coerce")
     df["opponent_points"] = pd.to_numeric(df["awayPoints"].where(df["is_home"].eq(1), df["homePoints"]), errors="coerce")
     df["score_diff"]      = df["team_points"] - df["opponent_points"]
@@ -582,7 +576,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     # weeks (nullable int)
     df["week"] = pd.to_numeric(df.get("week"), errors="coerce").astype("Int64")
 
-    # postseason renumber to new_week, then shift early rounds
+    # postseason renumbering (unchanged)
     post = df[df["seasonType"] == "postseason"].copy()
     if not post.empty:
         post = post.sort_values(["team","season","startDate"])
@@ -593,7 +587,6 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
         df.loc[mask_ps, "week"] = pd.to_numeric(df.loc[mask_ps, "new_week"], errors="coerce").astype("Int64")
         df.drop(columns=["new_week"], inplace=True)
 
-        # shift first 5 postseason weeks by max regular week in that season
         maxw = (df.loc[df["seasonType"] == "regular"]
                   .groupby("season")["week"]
                   .max()
@@ -606,25 +599,25 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
         ).astype("Int64")
         df.drop(columns=["max_regular_week"], inplace=True)
 
-    # dedupe first game’s week within (team, season): if duplicate week==1, set subsequent to 0
+    # dedupe first game’s week within (team, season)
     df = df.sort_values(["team","season","startDate"])
-    dup_mask = (df["week"] == 1) & df.duplicated(subset=["team","season","week"], keep="first")
+    dup_mask = (df["week"] == 1) & df.uplicated(subset=["team","season","week"], keep="first")
     df.loc[dup_mask, "week"] = 0
     df["week"] = pd.to_numeric(df["week"], errors="coerce").fillna(0).astype(int) + 1
 
-    # targets
+    # targets (leave NA when unplayed/no metrics)
     df["points_above_average"]         = pd.to_numeric(df.get("offense_ppa"), errors="coerce") * 65
     df["passing_points_above_average"] = pd.to_numeric(df.get("offense_passingPlays.ppa"), errors="coerce") * 65
     df["rushing_points_above_average"] = pd.to_numeric(df.get("offense_rushingPlays.ppa"), errors="coerce") * 65
 
-    # home field indicator as pandas Int64
+    # home field indicator
     hfi = pd.Series(np.nan, index=df.index)
     hfi.loc[df["neutralSite"].eq(1)] = 0
     hfi.loc[(df["neutralSite"].eq(0)) & (df["is_home"].eq(1))] = 1
     hfi.loc[(df["neutralSite"].eq(0)) & (df["is_home"].eq(0))] = -1
     df["home_field_indicator"] = hfi.astype("Int64")
 
-    # drop FCS vs FCS
+    # drop FCS vs FCS (unchanged)
     df = df[(df["team_fcs"] == 0) & (df["opponent_fcs"] == 0)].copy()
 
     # indices & integrity
@@ -638,13 +631,13 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
         if not (cnt == 2).all():
             raise AssertionError("Two rows per game id required.")
 
+    # opponent percentPPA imputation scaffold (unchanged, but removed writeback)
     opp_pct_map = (df.groupby(["opponent","season"])["team_percentPPA"]
                      .mean(numeric_only=True)
                      .rename("opponent_percentPPA_imputed")
                      .reset_index()
                      .rename(columns={"opponent":"opponent_key"}))
     df = df.merge(opp_pct_map, left_on=["opponent","season"], right_on=["opponent_key","season"], how="left")
-
     df.drop(columns=["opponent_key","opponent_percentPPA_imputed"], inplace=True)
 
     # final numeric hygiene
@@ -653,7 +646,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
     for c in ["team_percentPPA","opponent_percentPPA"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # robust within-season ordering + dense week rank (use transform to keep alignment)
+    # robust within-season ordering + dense week rank
     df = df.sort_values(["season","start_dt"])
     df["week_in_season"] = df.groupby("season")["week"].transform(lambda s: s.rank(method="dense")).astype("Int64")
 
