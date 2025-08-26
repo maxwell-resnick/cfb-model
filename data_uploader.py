@@ -1,6 +1,6 @@
 # pip install cfbd pandas numpy
 import os, re, itertools
-import io, json, requests
+import io, json
 import pandas as pd
 import numpy as np
 import cfbd
