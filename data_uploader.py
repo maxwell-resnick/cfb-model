@@ -601,7 +601,7 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 
     # dedupe first game’s week within (team, season)
     df = df.sort_values(["team","season","startDate"])
-    dup_mask = (df["week"] == 1) & df.uplicated(subset=["team","season","week"], keep="first")
+    dup_mask = (df["week"] == 1) & df.duplicated(subset=["team","season","week"], keep="first")
     df.loc[dup_mask, "week"] = 0
     df["week"] = pd.to_numeric(df["week"], errors="coerce").fillna(0).astype(int) + 1
 
