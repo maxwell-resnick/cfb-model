@@ -707,17 +707,14 @@ DEFAULT_NUM_COLS = [
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     x = df_slice.copy()
 
-    # TEXT: trim, turn empty -> NA
+    # TEXT: trim, empty -> NA (use pandas string dtype for safe .str ops)
     for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
-        # cast to pandas "string" dtype so .str ops are vectorized and NA-safe
-        s = x[c].astype("string")
-        s = s.str.strip()
+        s = x[c].astype("string").str.strip()
         x[c] = s.replace({"": pd.NA})
 
-    # DATES: to UTC, then epoch seconds (Int64, NA-preserving)
+    # DATES: to UTC -> epoch seconds (Int64)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        # pandas 2.x-safe int extraction
         epoch = (dt.view("int64") // 1_000_000_000)
         x[c] = pd.Series(epoch).astype("Int64")
 
@@ -786,23 +783,23 @@ def _fmt(v):
     s = str(v).replace("\n", " ")
     return (s[:80] + "…") if len(s) > 81 else s
 
-if not db_trim.empty and not model_trim.empty:
-    # We already have: common_index, nonkey_cols, eq, changed_rows
-    if 'eq' in locals():
-        # changed keys among rows that existed in DB
-        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
-        for idx in changed_keys:
-            # idx is a tuple (id, team, opponent) in the order of KEYS
-            gid, gteam, gopp = idx
-            parts = []
-            for c in nonkey_cols:
-                # Only print when that cell actually changed
-                if c in eq.columns and not eq.loc[idx, c]:
-                    old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
-                    new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
+if not db_trim.empty and not model_trim.empty and 'eq' in locals():
+    changed_keys_idx = eq.all(axis=1).index[~eq.all(axis=1)]
+    # build the list of non-key columns just once
+    nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
+    for idx in changed_keys_idx:
+        gid, gteam, gopp = idx  # tuple ordered as KEYS
+        parts = []
+        for c in nonkey_cols:
+            if c in db_idx.columns and c in model_idx.columns:
+                # if that cell actually differs
+                same = (pd.isna(db_idx.loc[idx, c]) and pd.isna(model_idx.loc[idx, c])) or (db_idx.loc[idx, c] == model_idx.loc[idx, c])
+                if not same:
+                    old_v = db_idx.loc[idx, c]
+                    new_v = model_idx.loc[idx, c]
                     parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
-            if parts:
-                print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
+        if parts:
+            print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
 
 # Print NEW rows (keys only) so YAML can include them too
 if not new_rows.empty:
