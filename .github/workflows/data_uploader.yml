@@ -56,11 +56,26 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-            # ensure 'requests' is available even if not listed
-            pip install requests
+            pip install requests  # ensure available
           else
             pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock requests
           fi
+
+      # ===== Snapshot entire table BEFORE run; also capture start timestamp =====
+      - name: Snapshot DB (before)
+        if: steps.timegate.outputs.run == 'true'
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > start_ts.txt
+          python - <<'PY'
+          import os, pandas as pd
+          from sqlalchemy import create_engine, text
+          eng = create_engine(os.environ["DATABASE_URL"])
+          with eng.connect() as conn:
+              df = pd.read_sql(text('SELECT * FROM "PreparedData"'), conn)
+          df.to_csv('prepared_before.csv', index=False)
+          PY
 
       - name: Run uploader
         if: steps.timegate.outputs.run == 'true'
@@ -78,11 +93,100 @@ jobs:
           echo "upserted=$UPS" >> $GITHUB_OUTPUT
           echo "Parsed Upserted rows: $UPS"
 
+      # ===== Pull only rows touched AFTER the run (date_updated) =====
+      - name: Snapshot DB (after, changed rows only)
+        if: steps.timegate.outputs.run == 'true'
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          START_TS=$(cat start_ts.txt)
+          echo "Start TS: $START_TS"
+          python - <<'PY'
+          import os, pandas as pd
+          from sqlalchemy import create_engine, text
+          start_ts = open('start_ts.txt').read().strip()
+          eng = create_engine(os.environ["DATABASE_URL"])
+          with eng.connect() as conn:
+              df = pd.read_sql(
+                  text('SELECT * FROM "PreparedData" WHERE date_updated >= :ts'),
+                  conn, params={'ts': start_ts}
+              )
+          df.to_csv('prepared_after_changed.csv', index=False)
+          PY
+
+      # ===== Compute per-cell diffs on (id, team, opponent) =====
+      - name: Compute per-cell diffs
+        if: steps.timegate.outputs.run == 'true'
+        run: |
+          python - <<'PY'
+          import pandas as pd, numpy as np, os, sys
+          keys = ['id','team','opponent']
+
+          def safe_read(path):
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+              return pd.DataFrame()
+            return pd.read_csv(path, low_memory=False)
+          before = safe_read('prepared_before.csv')
+          after  = safe_read('prepared_after_changed.csv')
+
+          # Prepare outputs
+          open('diff_lines.txt','w').close()
+          open('new_lines.txt','w').close()
+          cols = keys + ['column','old_value','new_value']
+          pd.DataFrame(columns=cols).to_csv('changed_cells.csv', index=False)
+
+          if after.empty or before.empty:
+              sys.exit(0)
+
+          # Align to common columns, index by composite key
+          common_cols = [c for c in after.columns if c in before.columns]
+          if not set(keys).issubset(common_cols):
+              sys.exit(0)
+          before = before[common_cols].set_index(keys)
+          after  = after[common_cols].set_index(keys)
+
+          # New rows (in 'after' but not 'before')
+          new_idx = after.index.difference(before.index)
+          with open('new_lines.txt','w') as f:
+              for i,t,o in new_idx:
+                  f.write(f"id={i} team={t} opponent={o} NEW\n")
+
+          # Existing rows that changed
+          existed = after.index.intersection(before.index)
+          rows=[]
+          for idx in existed:
+              b = before.loc[idx]
+              a = after.loc[idx]
+              for col in common_cols:
+                  if col in keys: continue
+                  bv, av = b[col], a[col]
+                  same = (pd.isna(bv) and pd.isna(av)) or (bv == av)
+                  if not same:
+                      rows.append({'id':idx[0],'team':idx[1],'opponent':idx[2],
+                                   'column':col,'old_value':bv,'new_value':av})
+          diffs = pd.DataFrame(rows)
+          diffs.to_csv('changed_cells.csv', index=False)
+
+          def fmt(v):
+              if pd.isna(v): return "NA"
+              s = str(v).replace("\n"," ")
+              return (s[:80] + "…") if len(s) > 81 else s
+
+          if not diffs.empty:
+              with open('diff_lines.txt','w') as f:
+                  for (i,t,o), g in diffs.groupby(['id','team','opponent']):
+                      parts = [f"{c}: {fmt(ov)} -> {fmt(nv)}" for c,ov,nv in zip(g['column'], g['old_value'], g['new_value'])]
+                      f.write(f"id={i} team={t} opponent={o} | " + "; ".join(parts) + "\n")
+          PY
+
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: steps.timegate.outputs.run == 'true'
         with:
-          name: uploader-log
-          path: uploader.log
+          name: changed-cells
+          path: |
+            changed_cells.csv
+            diff_lines.txt
+            new_lines.txt
           retention-days: 7
 
       # --- Test failure on demand
@@ -92,7 +196,7 @@ jobs:
           echo "Simulating failure as requested." >&2
           exit 1
 
-      # --- Discord: success
+      # ===== Discord: success (now includes WHAT changed) =====
       - name: Notify Discord (success)
         if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
         env:
@@ -101,16 +205,36 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           UPS="${{ steps.stats.outputs.upserted }}"
+
+          CHANGES=$( (test -f diff_lines.txt && cat diff_lines.txt) | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          NEWROWS=$( (test -f new_lines.txt  && cat new_lines.txt ) | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          [ -z "$CHANGES" ] && CHANGES="(none)"
+          [ -z "$NEWROWS" ] && NEWROWS="(none)"
+
           PAYLOAD=$(cat <<'JSON'
-          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
+          {
+            "username":"CFB Uploader",
+            "embeds":[
+              {
+                "title":"✅ data_uploader succeeded",
+                "description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```",
+                "url":"RUN_URL_PLACEHOLDER",
+                "timestamp":"NOW_PLACEHOLDER",
+                "color":3066993
+              }
+            ]
+          }
           JSON
           )
           PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
           PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          PAYLOAD=${PAYLOAD//CHANGES_PLACEHOLDER/"$CHANGES"}
+          PAYLOAD=${PAYLOAD//NEW_PLACEHOLDER/"$NEWROWS"}
+
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-      # --- Discord: failure
+      # --- Discord: failure (unchanged)
       - name: Notify Discord (failure)
         if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
         env:
