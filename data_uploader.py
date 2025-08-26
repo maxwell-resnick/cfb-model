@@ -669,10 +669,24 @@ DATABASE_URL = (
     "@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb"
 )
 
-# Discord webhook (set in GitHub Secrets → DISCORD_WEBHOOK)
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+# model_df must already exist at this point
+# model_df = build_model_data(combined_df)
 
-# Canonicalization rules (stable diffs)
+# ---------- CONNECT ----------
+engine = create_engine(
+   DATABASE_URL,
+   pool_pre_ping=True,
+   connect_args={"ssl_context": ssl.create_default_context()},
+)
+
+# ---------- OPTIONAL: ensure helper stamp column exists ----------
+with engine.begin() as conn:
+    conn.execute(text(
+        'ALTER TABLE "PreparedData" '
+        'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
+    ))
+
+# ---------- Canonicalization rules (stable diffs) ----------
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
     "homeConference","awayConference","homeClassification","awayClassification","provider"
@@ -689,104 +703,48 @@ DEFAULT_NUM_COLS = [
     "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
     "neutralSite","conferenceGame","homeId","awayId","id"
 ]
-# ===================================================
 
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
-    """Normalize values so diffing is stable across runs."""
     x = df_slice.copy()
 
-    # TEXT: trim; empty -> NA
+    # TEXT: trim, turn empty -> NA
     for c in (set(DEFAULT_TEXT_COLS) & set(x.columns)):
-        s = x[c].astype("string").str.strip()
+        # cast to pandas "string" dtype so .str ops are vectorized and NA-safe
+        s = x[c].astype("string")
+        s = s.str.strip()
         x[c] = s.replace({"": pd.NA})
 
-    # DATES: convert to epoch seconds (Int64)
+    # DATES: to UTC, then epoch seconds (Int64, NA-preserving)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        epoch = (dt.astype("int64") // 1_000_000_000)
+        # pandas 2.x-safe int extraction
+        epoch = (dt.view("int64") // 1_000_000_000)
         x[c] = pd.Series(epoch).astype("Int64")
 
-    # NUMERICS: coerce + round (tame float jitter)
+    # NUMERICS: coerce + round for stable diffs
     for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
         x[c] = pd.to_numeric(x[c], errors="coerce").round(6)
 
     return x
 
-def _fmt(v):
-    if pd.isna(v): return "NA"
-    if isinstance(v, float): return f"{v:.6g}"
-    s = str(v).replace("\n", " ")
-    return (s[:120] + "…") if len(s) > 121 else s
-
-def _get_engine():
-    return create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        connect_args={"ssl_context": ssl.create_default_context()},
-    )
-
-def _param_name(col: str) -> str:
-    # Make bind param names safe even for dotted columns
-    return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
-
-def _discord_post(content: str, files: dict | None = None):
-    if not DISCORD_WEBHOOK:
-        print("[Discord] DISCORD_WEBHOOK env var not set; skipping post.")
-        print(content)
-        return
-    data = {"content": content, "username": "CFB Uploader"}
-    req_files = None
-    if files:
-        req_files = {f"file{n}": (fname, blob)
-                     for n, (fname, blob) in enumerate(files.items(), 1)}
-    resp = requests.post(DISCORD_WEBHOOK, data=data, files=req_files, timeout=20)
-    if resp.status_code >= 300:
-        print("Discord post failed:", resp.status_code, resp.text)
-
-def _send_lines_as_chunks(title: str, lines: list[str], codeblock=True, chunk_limit=1900):
-    """Send long lists as multiple Discord messages under the 2k limit."""
-    _discord_post(f"**{title}**")
-    buf = ""
-    for ln in lines + [""]:
-        add = ln + "\n"
-        if len(buf) + len(add) > chunk_limit and buf:
-            _discord_post(f"```\n{buf}```" if codeblock else buf)
-            buf = add
-        else:
-            buf += add
-    if buf.strip():
-        _discord_post(f"```\n{buf}```" if codeblock else buf)
-
-# -------------- MAIN SYNC LOGIC --------------
-engine = _get_engine()
-
-# Ensure helper column exists
-with engine.begin() as conn:
-    conn.execute(text(
-        'ALTER TABLE "PreparedData" '
-        'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
-    ))
-
-# model_df must already exist at this point
-# model_df = build_model_data(combined_df)
-
-# Discover DB columns
+# ---------- 1) Discover DB columns & choose common cols ----------
 with engine.connect() as conn:
     cols_in_db = {c["name"] for c in inspect(conn).get_columns(TABLE, schema="public")}
 
-# Intersection of columns (avoid schema drift)
+# Only work with intersection to avoid schema drift
 common_cols = [c for c in model_df.columns if c in cols_in_db]
 for k in KEYS:
     if k not in common_cols:
         common_cols.append(k)
 
-# Read ALL rows from DB for those columns
+# ---------- 2) Read ALL rows from DB for those columns ----------
 read_cols = [c for c in common_cols if c in cols_in_db]
 cols_sql  = ", ".join(f'"{c}"' for c in read_cols)
+
 with engine.connect() as conn:
     db_df = pd.read_sql(text(f'SELECT {cols_sql} FROM "{TABLE}"'), conn)
 
-# Align frames
+# ---------- 3) Align frames ----------
 model_trim = model_df[common_cols].copy()
 db_trim    = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
 
@@ -794,13 +752,11 @@ db_trim    = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not
 model_idx = model_trim.set_index(KEYS, drop=False)
 db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
 
-# NEW rows
+# ---------- 4) Detect NEW rows ----------
 new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
-new_keys = new_rows[KEYS].copy()
 
-# CHANGED rows + per-cell changes
+# ---------- 5) Detect CHANGED rows (canonical comparison, ignore date_updated) ----------
 changed_rows = pd.DataFrame(columns=common_cols)
-cell_changes = pd.DataFrame(columns=KEYS + ["column","old_value","new_value"])
 diff_summary = {}
 
 if not db_trim.empty and not model_trim.empty:
@@ -812,24 +768,9 @@ if not db_trim.empty and not model_trim.empty:
         eq   = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
 
         diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
-
-        changed_keys_index = eq.all(axis=1).index[~eq.all(axis=1)]
-        if len(changed_keys_index):
-            changed_rows = model_idx.loc[changed_keys_index, common_cols].copy()
-
-            # Build a row-per-cell change table using original (non-canonical) values
-            diffs = []
-            for c in nonkey_cols:
-                mask = ~(eq[c])
-                if mask.any():
-                    for idx in mask[mask].index:
-                        old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
-                        new_v = model_idx.loc[idx, c]
-                        rec = {k: idx[i] for i, k in enumerate(KEYS)}
-                        rec.update({"column": c, "old_value": old_v, "new_value": new_v})
-                        diffs.append(rec)
-            if diffs:
-                cell_changes = pd.DataFrame(diffs, columns=KEYS + ["column","old_value","new_value"])
+        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
+        if len(changed_keys):
+            changed_rows = model_idx.loc[changed_keys, common_cols].copy()
 
 print(f"NEW rows: {len(new_rows)}")
 print(f"CHANGED rows (after normalization): {len(changed_rows)}")
@@ -838,15 +779,48 @@ if diff_summary:
     if nz:
         print("Changed cells by column (non-zero only):", nz)
 
-# UPSERT (INSERT new + UPDATE changed)
+# --- NEW: print per-row diffs for Discord to parse from uploader.log ---
+def _fmt(v):
+    if pd.isna(v):
+        return "NA"
+    s = str(v).replace("\n", " ")
+    return (s[:80] + "…") if len(s) > 81 else s
+
+if not db_trim.empty and not model_trim.empty:
+    # We already have: common_index, nonkey_cols, eq, changed_rows
+    if 'eq' in locals():
+        # changed keys among rows that existed in DB
+        changed_keys = eq.all(axis=1).index[~eq.all(axis=1)]
+        for idx in changed_keys:
+            # idx is a tuple (id, team, opponent) in the order of KEYS
+            gid, gteam, gopp = idx
+            parts = []
+            for c in nonkey_cols:
+                # Only print when that cell actually changed
+                if c in eq.columns and not eq.loc[idx, c]:
+                    old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
+                    new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
+                    parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
+            if parts:
+                print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
+
+# Print NEW rows (keys only) so YAML can include them too
+if not new_rows.empty:
+    for r in new_rows.itertuples(index=False):
+        print("DISCORD_NEW", f"id={getattr(r, 'id', 'NA')} team={getattr(r, 'team', 'NA')} opponent={getattr(r, 'opponent', 'NA')}")
+
+# ---------- 6) UPSERT (INSERT new + UPDATE changed) ----------
 to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
-upserted_count = 0
 
 if to_upsert.empty:
     print("No new/changed rows to upsert.")
 else:
     cols_for_insert = [c for c in common_cols if c != "date_updated"]  # let DB default on INSERT
     update_cols     = [c for c in cols_for_insert if c not in KEYS]
+
+    def _param_name(col: str) -> str:
+        # safe param names for dotted columns
+        return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
 
     param_map = {c: _param_name(c) for c in cols_for_insert}
     cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
@@ -872,14 +846,17 @@ else:
     with engine.begin() as conn:
         for i in range(0, len(recs), CHUNK):
             conn.execute(upsert_sql, recs[i:i+CHUNK])
-    upserted_count = len(to_upsert)
-    print(f"Upserted rows: {upserted_count}")
 
-# Ensure PK exists on (id, team, opponent)
+    print(f"Upserted rows: {len(to_upsert)}")
+
+# ---------- 7) (Optional) Ensure PK exists on (id, team, opponent) ----------
 with engine.begin() as conn:
+    # add NOT NULLs first (safe if already set)
     conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "id"       SET NOT NULL;'))
     conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "team"     SET NOT NULL;'))
     conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "opponent" SET NOT NULL;'))
+
+    # create PK if missing
     conn.execute(text('''
     DO $$
     BEGIN
@@ -898,37 +875,3 @@ with engine.begin() as conn:
     '''))
 
 print("Sync complete.")
-
-# ----------------- DISCORD NOTIFICATION -----------------
-summary_lines = [
-    f"**PreparedData sync**",
-    f"Upserted rows: **{upserted_count}** (new: {len(new_rows)}, changed: {len(changed_rows)})",
-]
-if diff_summary:
-    top = ", ".join([f"{k}:{v}" for k,v in sorted(diff_summary.items(), key=lambda x: -x[1])[:8]])
-    summary_lines.append(f"Top changed columns: {top}")
-_discord_post("\n".join(summary_lines))
-
-# Per-row detail for CHANGED rows
-if not cell_changes.empty:
-    detail_lines = []
-    for (gid, gteam, gopp), g in cell_changes.groupby(KEYS, sort=True):
-        parts = [f"{c}: {_fmt(o)} → {_fmt(n)}" for c,o,n in zip(g["column"], g["old_value"], g["new_value"])]
-        detail_lines.append(f"[id={gid}, team={gteam}, opp={gopp}] " + ", ".join(parts))
-    _send_lines_as_chunks("Changed cells (by row)", detail_lines)
-
-# Per-row list for NEW rows
-if not new_keys.empty:
-    lines_new = [f"[id={r.id}, team={r.team}, opp={r.opponent}] NEW" for r in new_keys.itertuples(index=False)]
-    _send_lines_as_chunks("New rows", lines_new)
-
-# Attach full CSVs for audit
-attachments = {}
-if not cell_changes.empty:
-    b1 = io.StringIO(); cell_changes.to_csv(b1, index=False)
-    attachments["changed_cells.csv"] = b1.getvalue().encode()
-if not new_keys.empty:
-    b2 = io.StringIO(); new_keys.to_csv(b2, index=False)
-    attachments["new_rows.csv"] = b2.getvalue().encode()
-if attachments:
-    _discord_post("Full diffs attached:", attachments)
