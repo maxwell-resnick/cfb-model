@@ -61,17 +61,42 @@ jobs:
             pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock requests
           fi
 
-      # ===== Snapshot entire table BEFORE run; also capture start timestamp =====
       - name: Snapshot DB (before)
         if: steps.timegate.outputs.run == 'true'
         env:
           DATABASE_URL: ${{ env.DATABASE_URL }}
+          PGUSER:       ${{ secrets.PGUSER }}
+          PGPASSWORD:   ${{ secrets.PGPASSWORD }}
+          PGHOST:       ${{ secrets.PGHOST }}
+          PGDATABASE:   ${{ secrets.PGDATABASE }}
         run: |
           date -u +%Y-%m-%dT%H:%M:%SZ > start_ts.txt
           python - <<'PY'
-          import os, pandas as pd
+          import os, pandas as pd, urllib.parse
           from sqlalchemy import create_engine, text
-          eng = create_engine(os.environ["DATABASE_URL"])
+          from sqlalchemy.engine import URL
+
+          def load_url():
+              raw = (os.environ.get("DATABASE_URL") or "").strip().strip('"').strip("'")
+              if raw and "://" in raw:
+                  return raw
+              # Fallback to component envs if full URL not present
+              user = os.environ.get("PGUSER")
+              pwd  = os.environ.get("PGPASSWORD")
+              host = os.environ.get("PGHOST")
+              db   = os.environ.get("PGDATABASE")
+              if all([user, pwd, host, db]):
+                  return URL.create(
+                      drivername="postgresql+pg8000",
+                      username=user,
+                      password=pwd,
+                      host=host,
+                      database=db,
+                  )
+              raise SystemExit("DATABASE_URL missing/invalid and component vars not provided.")
+
+          url = load_url()
+          eng = create_engine(url)
           with eng.connect() as conn:
               df = pd.read_sql(text('SELECT * FROM "PreparedData"'), conn)
           df.to_csv('prepared_before.csv', index=False)
@@ -98,14 +123,39 @@ jobs:
         if: steps.timegate.outputs.run == 'true'
         env:
           DATABASE_URL: ${{ env.DATABASE_URL }}
+          PGUSER:       ${{ secrets.PGUSER }}
+          PGPASSWORD:   ${{ secrets.PGPASSWORD }}
+          PGHOST:       ${{ secrets.PGHOST }}
+          PGDATABASE:   ${{ secrets.PGDATABASE }}
         run: |
           START_TS=$(cat start_ts.txt)
           echo "Start TS: $START_TS"
           python - <<'PY'
           import os, pandas as pd
           from sqlalchemy import create_engine, text
+          from sqlalchemy.engine import URL
+
+          def load_url():
+              raw = (os.environ.get("DATABASE_URL") or "").strip().strip('"').strip("'")
+              if raw and "://" in raw:
+                  return raw
+              user = os.environ.get("PGUSER")
+              pwd  = os.environ.get("PGPASSWORD")
+              host = os.environ.get("PGHOST")
+              db   = os.environ.get("PGDATABASE")
+              if all([user, pwd, host, db]):
+                  return URL.create(
+                      drivername="postgresql+pg8000",
+                      username=user,
+                      password=pwd,
+                      host=host,
+                      database=db,
+                  )
+              raise SystemExit("DATABASE_URL missing/invalid and component vars not provided.")
+
+          url = load_url()
           start_ts = open('start_ts.txt').read().strip()
-          eng = create_engine(os.environ["DATABASE_URL"])
+          eng = create_engine(url)
           with eng.connect() as conn:
               df = pd.read_sql(
                   text('SELECT * FROM "PreparedData" WHERE date_updated >= :ts'),
