@@ -704,6 +704,8 @@ DEFAULT_NUM_COLS = [
     "neutralSite","conferenceGame","homeId","awayId","id"
 ]
 
+IGNORE_FOR_DIFF = {"startDate"}
+
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     x = df_slice.copy()
 
@@ -771,12 +773,13 @@ if not db_trim.empty and not model_trim.empty:
 
 print(f"NEW rows: {len(new_rows)}")
 print(f"CHANGED rows (after normalization): {len(changed_rows)}")
+
 if diff_summary:
-    nz = {k: v for k, v in diff_summary.items() if v}
+    nz = {k: v for k, v in diff_summary.items() if v and k not in IGNORE_FOR_DIFF}
     if nz:
         print("Changed cells by column (non-zero only):", nz)
 
-# --- NEW: print per-row diffs for Discord to parse from uploader.log ---
+# --- NEW: print per-row diffs for Discord, ignoring startDate-only diffs ---
 def _fmt(v):
     if pd.isna(v):
         return "NA"
@@ -784,22 +787,23 @@ def _fmt(v):
     return (s[:80] + "…") if len(s) > 81 else s
 
 if not db_trim.empty and not model_trim.empty and 'eq' in locals():
-    changed_keys_idx = eq.all(axis=1).index[~eq.all(axis=1)]
-    # build the list of non-key columns just once
     nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
+    # rows that differ in at least one column (by canonical comparison)
+    changed_keys_idx = eq.all(axis=1).index[~eq.all(axis=1)]
     for idx in changed_keys_idx:
-        gid, gteam, gopp = idx  # tuple ordered as KEYS
+        # which columns changed (by canonical eq) and are not ignored
+        ch_cols = [c for c in nonkey_cols
+                   if (c in eq.columns and not eq.loc[idx, c] and c not in IGNORE_FOR_DIFF)]
+        if not ch_cols:
+            # only ignored columns (e.g., startDate) changed -> skip this row
+            continue
         parts = []
-        for c in nonkey_cols:
-            if c in db_idx.columns and c in model_idx.columns:
-                # if that cell actually differs
-                same = (pd.isna(db_idx.loc[idx, c]) and pd.isna(model_idx.loc[idx, c])) or (db_idx.loc[idx, c] == model_idx.loc[idx, c])
-                if not same:
-                    old_v = db_idx.loc[idx, c]
-                    new_v = model_idx.loc[idx, c]
-                    parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
-        if parts:
-            print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
+        for c in ch_cols:
+            old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
+            new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
+            parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
+        gid, gteam, gopp = idx  # composite key
+        print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
 
 # Print NEW rows (keys only) so YAML can include them too
 if not new_rows.empty:
