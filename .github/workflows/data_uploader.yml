@@ -90,7 +90,7 @@ jobs:
           echo "Simulating failure as requested." >&2
           exit 1
 
-      # --- Discord: success
+      # --- Discord: success (now includes per-row change tails)
       - name: Notify Discord (success)
         if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
         env:
@@ -99,16 +99,27 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           UPS="${{ steps.stats.outputs.upserted }}"
+
+          # Pull last few diff/new lines that Python printed
+          CHANGES=$(grep '^DISCORD_DIFF ' uploader.log | tail -n 12 | sed 's/^DISCORD_DIFF //; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          NEWROWS=$(grep '^DISCORD_NEW '  uploader.log | tail -n 12 | sed 's/^DISCORD_NEW //;  s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+
+          [ -z "$CHANGES" ] && CHANGES="(none)"
+          [ -z "$NEWROWS" ] && NEWROWS="(none)"
+
           PAYLOAD=$(cat <<'JSON'
-          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
+          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
           JSON
           )
           PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
           PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          PAYLOAD=${PAYLOAD//CHANGES_PLACEHOLDER/"$CHANGES"}
+          PAYLOAD=${PAYLOAD//NEW_PLACEHOLDER/"$NEWROWS"}
+
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-      # --- Discord: failure
+      # --- Discord: failure (unchanged)
       - name: Notify Discord (failure)
         if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
         env:
@@ -123,4 +134,3 @@ jobs:
           PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
-
