@@ -47,6 +47,7 @@ jobs:
             any::lubridate
             any::jsonlite
             any::httr
+            any:glmmTMB
 
       - name: Run opening_line_preds.R
         id: run_r
