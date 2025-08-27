@@ -18,10 +18,9 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # Repo secrets (Settings → Secrets and variables → Actions)
-      DATABASE_URL:     ${{ secrets.DATABASE_URL }}
-      GAME_PICK_WEBHOOK: ${{ secrets.GAME_PICK_WEBHOOK }}
-      R_KEEP_PKG_SOURCE: no
+      DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+      GAME_PICK_WEBHOOK:  ${{ secrets.GAME_PICK_WEBHOOK }}
+      R_KEEP_PKG_SOURCE:  no
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +31,7 @@ jobs:
           r-version: '4.4.1'
           use-public-rspm: true
 
-      # Install & cache the R deps your script actually uses
+      # Install & cache only the packages your script loads
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache: true
@@ -49,10 +48,31 @@ jobs:
             any::jsonlite
             any::httr
 
+      # Parse DATABASE_URL -> libpq env vars so RPostgres authenticates
+      - name: Export DB env vars from DATABASE_URL
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_ENV"
+          import os
+          from urllib.parse import urlparse
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              raise SystemExit("DATABASE_URL is missing")
+          u = urlparse(url)
+          print(f"PGHOST={u.hostname}")
+          print(f"PGPORT={u.port or 5432}")
+          print(f"PGDATABASE={u.path.lstrip('/')}")
+          print(f"PGUSER={u.username}")
+          print(f"PGPASSWORD={u.password}")
+          # also set the R fallback your script sometimes checks
+          print(f"NEON_PG_PASS={u.password}")
+          PY
+
       - name: Run opening_line_preds.R
-        # Map your GAME_PICK_WEBHOOK secret into the var your script expects
         env:
+          # Your R script expects DISCORD_WEBHOOK; map from GAME_PICK_WEBHOOK
           DISCORD_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
+          # DATABASE_URL is still available if you later choose to read it in R
           DATABASE_URL:    ${{ env.DATABASE_URL }}
         shell: bash
         run: |
@@ -67,7 +87,7 @@ jobs:
           path: r_run.log
           retention-days: 7
 
-      # Fallback Discord alert if the job itself fails
+      # Fallback Discord alert on workflow failure (your R script posts success)
       - name: Notify Discord on failure
         if: failure() && env.GAME_PICK_WEBHOOK != ''
         env:
@@ -94,3 +114,4 @@ jobs:
           payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           payload=${payload//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
+
