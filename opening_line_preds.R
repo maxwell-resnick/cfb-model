@@ -9,6 +9,7 @@ suppressPackageStartupMessages({
   library(lubridate)
   library(RPostgres)
   library(jsonlite)
+  library(glmmTMB)
 })
 
 # ------------------------------------------------------------------------------
