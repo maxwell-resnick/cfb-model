@@ -1,98 +1,151 @@
-name: game_picks
+name: data_uploader_daily
 
 on:
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Bypass NY time gate (true/false)'
+        required: false
+        default: 'false'
+      simulate_failure:
+        description: 'Force a failure to test notifications (true/false)'
+        required: false
+        default: 'false'
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+    - cron: "0 * * * *"  # hourly (UTC)
 
 permissions:
   contents: read
 
 concurrency:
-  group: game_picks-${{ github.ref }}
+  group: data_uploader_daily-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     env:
-      # Secrets (Settings → Secrets and variables → Actions)
+      # Repo secrets you must set in Settings → Secrets and variables → Actions
+      BEARER_TOKEN:     ${{ secrets.BEARER_TOKEN }}
+      DATABASE_URL:     ${{ secrets.DATABASE_URL }}
       GAME_PICK_WEBHOOK: ${{ secrets.GAME_PICK_WEBHOOK }}
-      NEON_PG_PASS:      ${{ secrets.NEON_PG_PASS }}
-      R_KEEP_PKG_SOURCE: no
+      FORCE_RUN:        ${{ github.event.inputs.force_run }}
+      SIM_FAIL:         ${{ github.event.inputs.simulate_failure }}
 
     steps:
+      - name: Time gate (run only 07–22 America/New_York, unless forced)
+        id: timegate
+        run: |
+          if [ "${FORCE_RUN}" = "true" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+            echo "Force-run enabled; skipping time window check."
+            exit 0
+          fi
+          HOUR_NY=$(TZ=America/New_York date +%H)
+          echo "Local NY hour: $HOUR_NY"
+          if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "Outside 07–22 NY window. Skipping."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.timegate.outputs.run == 'true'
 
-      # Fast R install + Posit Package Manager (precompiled binaries)
-      - uses: r-lib/actions/setup-r@v2
+      - uses: actions/setup-python@v5
+        if: steps.timegate.outputs.run == 'true'
         with:
-          r-version: '4.4.1'
-          use-public-rspm: true
+          python-version: "3.11"
 
-      # Install & cache R deps your script loads
-      - uses: r-lib/actions/setup-r-dependencies@v2
-        with:
-          cache: true
-          extra-packages: |
-            any::DBI
-            any::RPostgres
-            any::dplyr
-            any::tidyr
-            any::glue
-            any::qs
-            any::xgboost
-            any::slider
-            any::lubridate
-            any::jsonlite
-            any::httr
-            any::glmmTMB
+      - name: Install deps
+        if: steps.timegate.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
+          fi
 
-      - name: Run opening_line_preds.R
-        env:
-          # Your R script reads DISCORD_WEBHOOK; pipe the secret into that var
-          DISCORD_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
-        shell: bash
+      - name: Run uploader
+        if: steps.timegate.outputs.run == 'true'
+        id: run_uploader
         run: |
           set -o pipefail
-          Rscript --vanilla opening_line_preds.R 2>&1 | tee r_run.log
+          python data_uploader.py 2>&1 | tee uploader.log
 
-      - name: Upload run log
+      - name: Parse upsert count
+        if: steps.timegate.outputs.run == 'true'
+        id: stats
+        run: |
+          UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
+          UPS=${UPS:-0}
+          echo "upserted=$UPS" >> $GITHUB_OUTPUT
+          echo "Parsed Upserted rows: $UPS"
+
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: r-run-log
-          path: r_run.log
+          name: uploader-log
+          path: uploader.log
           retention-days: 7
 
-      # Fallback Discord alert on workflow failure (your R script posts success)
-      - name: Notify Discord on failure
-        if: failure() && env.GAME_PICK_WEBHOOK != ''
+      # --- Test failure on demand
+      - name: Simulate failure (for testing notifications)
+        if: steps.timegate.outputs.run == 'true' && env.SIM_FAIL == 'true'
+        run: |
+          echo "Simulating failure as requested." >&2
+          exit 1
+
+      # --- Discord (via GAME_PICK_WEBHOOK): success (includes WHAT changed from uploader.log)
+      - name: Notify Discord (success)
+        if: steps.timegate.outputs.run == 'true' && success() && env.GAME_PICK_WEBHOOK != ''
         env:
           WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
-        shell: bash
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          payload=$(cat <<'JSON'
+          UPS="${{ steps.stats.outputs.upserted }}"
+          CHANGES=$(grep -E '^DISCORD_DIFF ' uploader.log | sed 's/^DISCORD_DIFF //' | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          NEWROWS=$(grep -E '^DISCORD_NEW ' uploader.log  | sed 's/^DISCORD_NEW //'  | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          [ -z "$CHANGES" ] && CHANGES="(none)"
+          [ -z "$NEWROWS" ] && NEWROWS="(none)"
+          PAYLOAD=$(cat <<'JSON'
           {
-            "username":"OpeningLine Bot",
+            "username":"CFB Uploader",
             "embeds":[
               {
-                "title":"❌ opening_line_preds failed",
-                "description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.",
+                "title":"✅ data_uploader succeeded",
+                "description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```",
                 "url":"RUN_URL_PLACEHOLDER",
                 "timestamp":"NOW_PLACEHOLDER",
-                "color":15158332
+                "color":3066993
               }
             ]
           }
           JSON
           )
-          payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
-          payload=${payload//NOW_PLACEHOLDER/"$NOW"}
-          curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
+          PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
+          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          PAYLOAD=${PAYLOAD//CHANGES_PLACEHOLDER/"$CHANGES"}
+          PAYLOAD=${PAYLOAD//NEW_PLACEHOLDER/"$NEWROWS"}
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-
+      # --- Discord (via GAME_PICK_WEBHOOK): failure
+      - name: Notify Discord (failure)
+        if: steps.timegate.outputs.run == 'true' && failure() && env.GAME_PICK_WEBHOOK != ''
+        env:
+          WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PAYLOAD=$(cat <<'JSON'
+          {"username":"CFB Uploader","embeds":[{"title":"❌ data_uploader failed","description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":15158332}]}
+          JSON
+          )
+          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"

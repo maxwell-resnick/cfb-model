@@ -489,10 +489,7 @@ suppressPackageStartupMessages({
 })
 
 
-DISCORD_WEBHOOK <- Sys.getenv("GAME_PICK_WEBHOOK", unset = "")
-if (!nzchar(WEBHOOK)) {
-  DISCORD_WEBHOOK <- Sys.getenv("DISCORD_WEBHOOK", unset = "")
-}
+GAME_PICK_WEBHOOK <- Sys.getenv("GAME_PICK_WEBHOOK", unset = "")
 
 notify_discord <- function(webhook, title, desc, color = 3066993, fields = list()) {
   if (is.na(webhook) || !nzchar(webhook)) return(invisible(FALSE))
@@ -626,7 +623,7 @@ sync_gamepicks <- function(con, df) {
     sample_block(res$inserted_ids, "New picks (sample)"),
     sample_block(res$updated_ids,  "Updated picks (sample)")
   )
-  notify_discord(DISCORD_WEBHOOK, "GamePicks sync", desc, color = 3066993, fields = fields)
+  notify_discord(GAME_PICK_WEBHOOK, "GamePicks sync", desc, color = 3066993, fields = fields)
   
   invisible(res)
 }
