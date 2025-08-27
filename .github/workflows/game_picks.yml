@@ -1,63 +1,40 @@
-name: opening_line_preds
+name: game_picks
 
 on:
   workflow_dispatch:
-    inputs:
-      force_run:
-        description: 'Bypass NY time gate (true/false)'
-        required: false
-        default: 'false'
   schedule:
-    - cron: "*/30 * * * *"  # every 30 minutes (UTC)
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+
+permissions:
+  contents: read
 
 concurrency:
-  group: opening-line-preds
-  cancel-in-progress: true
+  group: game_picks-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
+      # Secrets you set in the repo → Settings → Secrets and variables → Actions
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-      NEON_DB_HOST: ${{ secrets.NEON_DB_HOST }}
-      NEON_DB_PORT: ${{ secrets.NEON_DB_PORT }}
-      NEON_DB_NAME: ${{ secrets.NEON_DB_NAME }}
-      NEON_DB_USER: ${{ secrets.NEON_DB_USER }}
-      NEON_DB_PASS: ${{ secrets.NEON_DB_PASS }}
-      FORCE_RUN: ${{ github.event.inputs.force_run }}
+      NEON_PG_PASS:    ${{ secrets.NEON_PG_PASS }}   # if your R script reads this
+      R_KEEP_PKG_SOURCE: no
 
     steps:
-      - name: Time gate (run only 07–22 America/New_York, unless forced)
-        id: timegate
-        run: |
-          if [ "${FORCE_RUN}" = "true" ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-            echo "Force-run enabled; skipping time window check."
-            exit 0
-          fi
-          HOUR_NY=$(TZ=America/New_York date +%H)
-          echo "Local NY hour: $HOUR_NY"
-          if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-          else
-            echo "run=false" >> $GITHUB_OUTPUT
-            echo "Outside 07–22 NY window. Skipping."
-          fi
+      - uses: actions/checkout@v4
 
-      - name: Checkout
-        if: steps.timegate.outputs.run == 'true'
-        uses: actions/checkout@v4
-
-      - name: Set up R
-        if: steps.timegate.outputs.run == 'true'
-        uses: r-lib/actions/setup-r@v2
+      # Fast R setup + binary CRAN via Posit Package Manager
+      - uses: r-lib/actions/setup-r@v2
         with:
-          r-version: 'release'
+          r-version: '4.4.1'
+          use-public-rspm: true
 
-      - name: Install R dependencies
-        if: steps.timegate.outputs.run == 'true'
-        uses: r-lib/actions/setup-r-dependencies@v2
+      # Install & cache R dependencies
+      - uses: r-lib/actions/setup-r-dependencies@v2
         with:
+          cache: true
           packages: |
             any::DBI
             any::RPostgres
@@ -68,33 +45,32 @@ jobs:
             any::xgboost
             any::slider
             any::lubridate
-            any::httr
             any::jsonlite
-          extra-packages: any::remotes
-          needs: check
+            any::httr
 
       - name: Run opening_line_preds.R
-        if: steps.timegate.outputs.run == 'true'
+        id: run_r
+        shell: bash
         run: |
           set -o pipefail
-          Rscript opening_line_preds.R 2>&1 | tee run.log
+          Rscript --vanilla opening_line_preds.R 2>&1 | tee r_run.log
 
       - name: Upload run log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opening-line-preds-log
-          path: run.log
+          name: r-run-log
+          path: r_run.log
           retention-days: 7
 
-      - name: Notify Discord (failure)
-        if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
-        env:
-          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+      # Fallback Discord alert on workflow failure (your R script posts success)
+      - name: Notify Discord on failure
+        if: failure() && env.DISCORD_WEBHOOK != ''
+        shell: bash
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          PAYLOAD=$(cat <<'JSON'
+          payload=$(cat <<'JSON'
           {
             "username":"OpeningLine Bot",
             "embeds":[
@@ -109,6 +85,7 @@ jobs:
           }
           JSON
           )
-          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
-          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
-          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+          payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          payload=${payload//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
+
