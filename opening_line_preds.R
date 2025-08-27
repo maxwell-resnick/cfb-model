@@ -488,11 +488,11 @@ suppressPackageStartupMessages({
   library(httr)  # for Discord POST
 })
 
-# Use env var if present; otherwise fall back to the value you gave me.
-DISCORD_WEBHOOK <- Sys.getenv(
-  "DISCORD_WEBHOOK",
-  "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
-)
+
+DISCORD_WEBHOOK <- Sys.getenv("GAME_PICK_WEBHOOK", unset = "")
+if (!nzchar(WEBHOOK)) {
+  DISCORD_WEBHOOK <- Sys.getenv("DISCORD_WEBHOOK", unset = "")
+}
 
 notify_discord <- function(webhook, title, desc, color = 3066993, fields = list()) {
   if (is.na(webhook) || !nzchar(webhook)) return(invisible(FALSE))
