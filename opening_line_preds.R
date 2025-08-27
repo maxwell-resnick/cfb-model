@@ -8,6 +8,7 @@ suppressPackageStartupMessages({
   library(slider)
   library(lubridate)
   library(RPostgres)
+  library(jsonlite)
 })
 
 # ------------------------------------------------------------------------------
@@ -292,20 +293,18 @@ pred_2025 <- pred_2025 %>%
   dplyr::mutate(pred_spread = pred_team_points - pred_opponent_points)
 
 pred_2025 <- pred_2025 %>%
-  mutate(
+  dplyr::mutate(
     n_open_lines = rowSums(!is.na(cbind(
       bovada_formatted_opening_spread,
       espnbet_formatted_opening_spread,
       draftkings_formatted_opening_spread
     ))),
-    
     edge_bov  = pred_spread - bovada_formatted_opening_spread,
     edge_espn = pred_spread - espnbet_formatted_opening_spread,
     edge_dk   = pred_spread - draftkings_formatted_opening_spread,
     edge_bov  = ifelse(is.na(edge_bov),  -Inf, edge_bov),
     edge_espn = ifelse(is.na(edge_espn), -Inf, edge_espn),
     edge_dk   = ifelse(is.na(edge_dk),   -Inf, edge_dk),
-    
     best_idx  = ifelse(n_open_lines == 0, NA_integer_,
                        max.col(cbind(edge_bov, edge_espn, edge_dk), ties.method = "first")),
     best_book_open = dplyr::case_when(
@@ -324,16 +323,17 @@ pred_2025 <- pred_2025 %>%
   ) %>%
   dplyr::select(-edge_bov, -edge_espn, -edge_dk, -best_idx)
 
+# ensure eps exists
+if (!exists("eps", inherits = TRUE)) eps <- 1e-3
+
 pred_2025 <- pred_2025 %>%
   dplyr::mutate(
     cover_margin   = ifelse(!is.na(score_diff) & !is.na(best_line_open),
                             score_diff - best_line_open, NA_real_),
     pick_margin    = ifelse(!is.na(best_line_open),
                             pred_spread - best_line_open, NA_real_),
-    
     is_push_actual = ifelse(!is.na(cover_margin), abs(cover_margin) <= eps, NA),
     is_push_pick   = ifelse(!is.na(pick_margin),  abs(pick_margin)  <= eps, NA),
-    
     Hit = dplyr::case_when(
       is.na(cover_margin) | is.na(is_push_pick) ~ NA,
       is_push_actual | is_push_pick             ~ NA,
@@ -363,42 +363,34 @@ pred_2025 <- pred_2025 %>%
     pred_total   = pred_team_points + pred_opponent_points,
     actual_total = ifelse(!is.na(team_points) & !is.na(opponent_points),
                           team_points + opponent_points, NA_real_),
-    
     n_open_ou = rowSums(!is.na(cbind(
       bovada_formatted_opening_overunder,
       espnbet_formatted_opening_overunder,
       draftkings_formatted_opening_overunder
     ))),
-    
     over_bov  = pred_total - bovada_formatted_opening_overunder,
     over_espn = pred_total - espnbet_formatted_opening_overunder,
     over_dk   = pred_total - draftkings_formatted_opening_overunder,
-    
     under_bov  = bovada_formatted_opening_overunder - pred_total,
     under_espn = espnbet_formatted_opening_overunder - pred_total,
     under_dk   = draftkings_formatted_opening_overunder - pred_total,
-    
     over_bov   = ifelse(is.na(over_bov),  -Inf, over_bov),
     over_espn  = ifelse(is.na(over_espn), -Inf, over_espn),
     over_dk    = ifelse(is.na(over_dk),   -Inf, over_dk),
     under_bov  = ifelse(is.na(under_bov),  -Inf, under_bov),
     under_espn = ifelse(is.na(under_espn), -Inf, under_espn),
     under_dk   = ifelse(is.na(under_dk),   -Inf, under_dk),
-    
     best_over_idx  = ifelse(n_open_ou == 0, NA_integer_,
                             max.col(cbind(over_bov, over_espn, over_dk), ties.method = "first")),
     best_under_idx = ifelse(n_open_ou == 0, NA_integer_,
                             max.col(cbind(under_bov, under_espn, under_dk), ties.method = "first")),
-    
     best_over_edge  = pmax(over_bov,  over_espn,  over_dk),
     best_under_edge = pmax(under_bov, under_espn, under_dk),
-    
     ou_pick = dplyr::case_when(
       n_open_ou == 0                    ~ NA_character_,
       best_over_edge >= best_under_edge ~ "over",
       TRUE                              ~ "under"
     ),
-    
     best_ou_book_open = dplyr::case_when(
       ou_pick == "over"  & best_over_idx  == 1L ~ "bovada",
       ou_pick == "over"  & best_over_idx  == 2L ~ "espnbet",
@@ -490,9 +482,40 @@ final_2025_out <- final_2025 %>%
     ou_pick              = as.character(ou_pick)
   )
 
-# ------------------------------------------------------------------------------
-# 13) Upsert into public."GamePicks" by id (only update if a row actually changed)
-# ------------------------------------------------------------------------------
+# --- add this near your other libs ---
+suppressPackageStartupMessages({
+  library(httr)  # for Discord POST
+})
+
+# Use env var if present; otherwise fall back to the value you gave me.
+DISCORD_WEBHOOK <- Sys.getenv(
+  "DISCORD_WEBHOOK",
+  "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
+)
+
+notify_discord <- function(webhook, title, desc, color = 3066993, fields = list()) {
+  if (is.na(webhook) || !nzchar(webhook)) return(invisible(FALSE))
+  payload <- list(
+    username = "OpeningLine Bot",
+    embeds = list(list(
+      title = title,
+      description = desc,
+      color = color,
+      timestamp = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      fields = fields
+    ))
+  )
+  try({
+    httr::POST(
+      url = webhook,
+      httr::add_headers(`Content-Type` = "application/json"),
+      body = jsonlite::toJSON(payload, auto_unbox = TRUE)
+    )
+  }, silent = TRUE)
+  invisible(TRUE)
+}
+
+# ---------------- sync with counts & IDs, then Discord ----------------
 sync_gamepicks <- function(con, df) {
   stopifnot("id" %in% names(df))
   
@@ -518,12 +541,8 @@ sync_gamepicks <- function(con, df) {
   coerce_if_present("id", as.integer)
   coerce_if_present("season", as.integer)
   coerce_if_present("week", as.integer)
-  for (c in c("team","opponent","best_book_open","best_ou_book_open","ou_pick")) {
-    coerce_if_present(c, as.character)
-  }
-  for (c in c("Hit","ou_Hit")) {
-    coerce_if_present(c, as.logical)
-  }
+  for (c in c("team","opponent","best_book_open","best_ou_book_open","ou_pick")) coerce_if_present(c, as.character)
+  for (c in c("Hit","ou_Hit")) coerce_if_present(c, as.logical)
   
   stage_name <- DBI::Id(schema = NULL, table = "GamePicks_stage")
   if (DBI::dbExistsTable(con, stage_name)) DBI::dbRemoveTable(con, stage_name)
@@ -533,31 +552,92 @@ sync_gamepicks <- function(con, df) {
   DBI::dbWriteTable(con, stage_name, df_stage, temporary = TRUE, overwrite = TRUE)
   
   set_cols <- setdiff(insert_cols, "id")
+  cmp_cols <- setdiff(set_cols, "updated_at")
   
   q_insert_cols <- paste0('"', insert_cols, '"', collapse = ", ")
-  q_set_clause  <- paste0('"', set_cols, "\" = EXCLUDED.\"", set_cols, '"', collapse = ", ")
+  q_update_assign <- paste0('"', set_cols, '" = s."', set_cols, '"', collapse = ", ")
+  q_row_t <- paste0('t."', cmp_cols, '"', collapse = ", ")
+  q_row_s <- paste0('s."', cmp_cols, '"', collapse = ", ")
   
-  cmp_cols   <- setdiff(set_cols, "updated_at")
-  q_cmp_left  <- paste0('"GamePicks"."', cmp_cols, '"', collapse = ", ")
-  q_cmp_right <- paste0('EXCLUDED."', cmp_cols, '"', collapse = ", ")
-  
-  sql_upsert <- glue::glue('
-    INSERT INTO "GamePicks" ({q_insert_cols})
-    SELECT {q_insert_cols} FROM "GamePicks_stage"
-    ON CONFLICT (id) DO UPDATE
-    SET {q_set_clause}, "updated_at" = NOW()
-    WHERE ROW({q_cmp_left}) IS DISTINCT FROM ROW({q_cmp_right});
+  # Perform UPDATE (only when something actually changed) and count IDs
+  sql_update <- glue::glue('
+    WITH upd AS (
+      UPDATE "GamePicks" t
+      SET {q_update_assign}, "updated_at" = NOW()
+      FROM "GamePicks_stage" s
+      WHERE t.id = s.id
+        AND ROW({q_row_t}) IS DISTINCT FROM ROW({q_row_s})
+      RETURNING t.id
+    )
+    SELECT COALESCE(COUNT(*),0)::int AS n_updated,
+           COALESCE(array_agg(id), ARRAY[]::bigint[]) AS updated_ids
+    FROM upd;
   ')
   
-  DBI::dbWithTransaction(con, {
-    DBI::dbExecute(con, sql_upsert)
+  # Insert new rows and count IDs
+  sql_insert <- glue::glue('
+    WITH ins AS (
+      INSERT INTO "GamePicks" ({q_insert_cols})
+      SELECT {q_insert_cols} FROM "GamePicks_stage" s
+      WHERE NOT EXISTS (SELECT 1 FROM "GamePicks" t WHERE t.id = s.id)
+      RETURNING id
+    )
+    SELECT COALESCE(COUNT(*),0)::int AS n_inserted,
+           COALESCE(array_agg(id), ARRAY[]::bigint[]) AS inserted_ids
+    FROM ins;
+  ')
+  
+  res <- DBI::dbWithTransaction(con, {
+    upd <- DBI::dbGetQuery(con, sql_update)
+    ins <- DBI::dbGetQuery(con, sql_insert)
     try(DBI::dbRemoveTable(con, stage_name), silent = TRUE)
+    list(
+      updated  = as.integer(upd$n_updated[1]),
+      inserted = as.integer(ins$n_inserted[1]),
+      updated_ids  = if (!is.null(upd$updated_ids[[1]])) upd$updated_ids[[1]] else integer(),
+      inserted_ids = if (!is.null(ins$inserted_ids[[1]])) ins$inserted_ids[[1]] else integer()
+    )
   })
+  
+  # --- Discord notification
+  fmt_vec <- function(x, n = 10) {
+    if (length(x) == 0) "(none)"
+    else paste(head(x, n), collapse = ", ")
+  }
+  # Tiny summaries for new/updated picks (top by |pick_margin|)
+  sample_block <- function(ids, lbl) {
+    if (length(ids) == 0) return(list(name = lbl, value = "(none)", inline = FALSE))
+    df_small <- final_2025_out %>%
+      dplyr::filter(id %in% ids) %>%
+      dplyr::arrange(dplyr::desc(abs(pick_margin))) %>%
+      dplyr::mutate(line = sprintf("%s vs %s wk%02d: pm=%.2f (%s %.1f)",
+                                   team, opponent, week, pick_margin, best_book_open %||% "", best_line_open %||% NA_real_)) %>%
+      dplyr::pull(line)
+    val <- paste(utils::head(df_small, 6), collapse = "\n")
+    list(name = lbl, value = if (nzchar(val)) val else "(none)", inline = FALSE)
+  }
+  
+  desc <- sprintf("Upsert complete.\nInserted: **%d**\nUpdated: **%d**",
+                  res$inserted, res$updated)
+  fields <- list(
+    list(name = "Inserted IDs (sample)", value = fmt_vec(res$inserted_ids), inline = FALSE),
+    list(name = "Updated IDs (sample)",  value = fmt_vec(res$updated_ids),  inline = FALSE),
+    sample_block(res$inserted_ids, "New picks (sample)"),
+    sample_block(res$updated_ids,  "Updated picks (sample)")
+  )
+  notify_discord(DISCORD_WEBHOOK, "GamePicks sync", desc, color = 3066993, fields = fields)
+  
+  invisible(res)
 }
 
-# Run the sync
+# --- run the sync + notify ---
 stopifnot(anyDuplicated(final_2025_out$id) == 0)
-sync_gamepicks(con, final_2025_out)
+res_sync <- sync_gamepicks(con, final_2025_out)
+print(res_sync)
+
+
+
+
 
 # Optional: dbDisconnect(con)
 

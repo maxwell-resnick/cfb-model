@@ -1,0 +1,114 @@
+name: opening_line_preds
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Bypass NY time gate (true/false)'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes (UTC)
+
+concurrency:
+  group: opening-line-preds
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      NEON_DB_HOST: ${{ secrets.NEON_DB_HOST }}
+      NEON_DB_PORT: ${{ secrets.NEON_DB_PORT }}
+      NEON_DB_NAME: ${{ secrets.NEON_DB_NAME }}
+      NEON_DB_USER: ${{ secrets.NEON_DB_USER }}
+      NEON_DB_PASS: ${{ secrets.NEON_DB_PASS }}
+      FORCE_RUN: ${{ github.event.inputs.force_run }}
+
+    steps:
+      - name: Time gate (run only 07–22 America/New_York, unless forced)
+        id: timegate
+        run: |
+          if [ "${FORCE_RUN}" = "true" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+            echo "Force-run enabled; skipping time window check."
+            exit 0
+          fi
+          HOUR_NY=$(TZ=America/New_York date +%H)
+          echo "Local NY hour: $HOUR_NY"
+          if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "Outside 07–22 NY window. Skipping."
+          fi
+
+      - name: Checkout
+        if: steps.timegate.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        if: steps.timegate.outputs.run == 'true'
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+
+      - name: Install R dependencies
+        if: steps.timegate.outputs.run == 'true'
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::DBI
+            any::RPostgres
+            any::dplyr
+            any::tidyr
+            any::glue
+            any::qs
+            any::xgboost
+            any::slider
+            any::lubridate
+            any::httr
+            any::jsonlite
+          extra-packages: any::remotes
+          needs: check
+
+      - name: Run opening_line_preds.R
+        if: steps.timegate.outputs.run == 'true'
+        run: |
+          set -o pipefail
+          Rscript opening_line_preds.R 2>&1 | tee run.log
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opening-line-preds-log
+          path: run.log
+          retention-days: 7
+
+      - name: Notify Discord (failure)
+        if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
+        env:
+          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PAYLOAD=$(cat <<'JSON'
+          {
+            "username":"OpeningLine Bot",
+            "embeds":[
+              {
+                "title":"❌ opening_line_preds failed",
+                "description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.",
+                "url":"RUN_URL_PLACEHOLDER",
+                "timestamp":"NOW_PLACEHOLDER",
+                "color":15158332
+              }
+            ]
+          }
+          JSON
+          )
+          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
