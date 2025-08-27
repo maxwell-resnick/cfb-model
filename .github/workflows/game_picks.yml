@@ -36,20 +36,20 @@ jobs:
         with:
           cache: true
           packages: |
-          any::DBI
-          any::RPostgres
-          any::dplyr
-          any::tidyr
-          any::glue
-          any::qs
-          any::xgboost
-          any::slider
-          any::lubridate
-          any::jsonlite
-          any::httr
-          any::glmmTMB
-          any::TMB
-          
+            any::DBI
+            any::RPostgres
+            any::dplyr
+            any::tidyr
+            any::glue
+            any::qs
+            any::xgboost
+            any::slider
+            any::lubridate
+            any::jsonlite
+            any::httr
+            any::glmmTMB
+            any::TMB
+
       # Parse DATABASE_URL -> libpq env vars so RPostgres authenticates
       - name: Export DB env vars from DATABASE_URL
         shell: bash
