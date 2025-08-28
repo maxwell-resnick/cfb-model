@@ -3,8 +3,8 @@ name: game_picks
 on:
   workflow_dispatch:
   schedule:
-    # Nightly at 06:00 UTC (adjust as you like)
-    - cron: "0 6 * * *"
+    # Trigger every 15 minutes (UTC); time gate below enforces 08:15–22:15 America/New_York
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -26,16 +26,32 @@ jobs:
       R_KEEP_PKG_SOURCE:  no
 
     steps:
+      - name: Time gate (run only 08:15–22:15 America/New_York)
+        id: timegate
+        run: |
+          HOUR_NY=$(TZ=America/New_York date +%H)
+          MIN_NY=$(TZ=America/New_York date +%M)
+          echo "NY time: $HOUR_NY:$MIN_NY"
+          if [ "$MIN_NY" -eq 15 ] && [ "$HOUR_NY" -ge 8 ] && [ "$HOUR_NY" -le 22 ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "Outside 08:15–22:15 NY window. Skipping."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.timegate.outputs.run == 'true'
 
       # R with Posit Public Package Manager binaries
       - uses: r-lib/actions/setup-r@v2
+        if: steps.timegate.outputs.run == 'true'
         with:
           r-version: '4.4.1'
           use-public-rspm: true
 
       # Install & cache CRAN packages your script loads (no comments here!)
       - uses: r-lib/actions/setup-r-dependencies@v2
+        if: steps.timegate.outputs.run == 'true'
         with:
           cache: true
           packages: |
@@ -57,12 +73,14 @@ jobs:
 
       # Install oddsapiR from SportsDataverse R-Universe (not CRAN)
       - name: Install oddsapiR (R-Universe)
+        if: steps.timegate.outputs.run == 'true'
         shell: bash
         run: |
           Rscript -e 'install.packages("oddsapiR", repos=c("https://sportsdataverse.r-universe.dev","https://cloud.r-project.org"))'
 
       # Parse DATABASE_URL into libpq env vars for RPostgres
       - name: Export DB env vars from DATABASE_URL
+        if: steps.timegate.outputs.run == 'true'
         shell: bash
         run: |
           python - <<'PY' >> "$GITHUB_ENV"
@@ -82,9 +100,9 @@ jobs:
           PY
 
       - name: Run opening_line_preds.R
+        if: steps.timegate.outputs.run == 'true'
         shell: bash
         env:
-          # Your script reads GAME_PICK_WEBHOOK already; pass through just in case.
           GAME_PICK_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
         run: |
           set -o pipefail
@@ -100,7 +118,7 @@ jobs:
 
       # Fallback Discord alert if the workflow fails before the script posts anything
       - name: Notify Discord on failure
-        if: failure() && env.GAME_PICK_WEBHOOK != ''
+        if: steps.timegate.outputs.run == 'true' && failure() && env.GAME_PICK_WEBHOOK != ''
         env:
           WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
         shell: bash
@@ -113,7 +131,7 @@ jobs:
             "embeds":[
               {
                 "title":"❌ opening_line_preds failed",
-                "description":"Branch: **${{ github.ref_name }}**\\nSee run logs for details.",
+                "description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.",
                 "url":"RUN_URL_PLACEHOLDER",
                 "timestamp":"NOW_PLACEHOLDER",
                 "color":15158332

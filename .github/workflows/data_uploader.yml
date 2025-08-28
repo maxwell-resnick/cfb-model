@@ -12,7 +12,7 @@ on:
         required: false
         default: 'false'
   schedule:
-    - cron: "0 * * * *"  # hourly (UTC)
+    - cron: "0 * * * *"  # run hourly in UTC; time gate below enforces 08–22 America/New_York
 
 jobs:
   run:
@@ -25,7 +25,7 @@ jobs:
       SIM_FAIL:  ${{ github.event.inputs.simulate_failure }}
 
     steps:
-      - name: Time gate (run only 07–22 America/New_York, unless forced)
+      - name: Time gate (run only 08–22 America/New_York, unless forced)
         id: timegate
         run: |
           if [ "${FORCE_RUN}" = "true" ]; then
@@ -35,11 +35,11 @@ jobs:
           fi
           HOUR_NY=$(TZ=America/New_York date +%H)
           echo "Local NY hour: $HOUR_NY"
-          if [ "$HOUR_NY" -ge 7 ] && [ "$HOUR_NY" -le 22 ]; then
+          if [ "$HOUR_NY" -ge 8 ] && [ "$HOUR_NY" -le 22 ]; then
             echo "run=true" >> $GITHUB_OUTPUT
           else
             echo "run=false" >> $GITHUB_OUTPUT
-            echo "Outside 07–22 NY window. Skipping."
+            echo "Outside 08–22 NY window. Skipping."
           fi
 
       - uses: actions/checkout@v4
@@ -83,14 +83,12 @@ jobs:
           path: uploader.log
           retention-days: 7
 
-      # --- Test failure on demand
       - name: Simulate failure (for testing notifications)
         if: steps.timegate.outputs.run == 'true' && env.SIM_FAIL == 'true'
         run: |
           echo "Simulating failure as requested." >&2
           exit 1
 
-      # --- Discord: success (includes WHAT changed from uploader.log)
       - name: Notify Discord (success)
         if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
         env:
@@ -99,7 +97,6 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           UPS="${{ steps.stats.outputs.upserted }}"
-          # grab tail of "what changed" from the log
           CHANGES=$(grep -E '^DISCORD_DIFF ' uploader.log | sed 's/^DISCORD_DIFF //' | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
           NEWROWS=$(grep -E '^DISCORD_NEW ' uploader.log  | sed 's/^DISCORD_NEW //'  | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
           [ -z "$CHANGES" ] && CHANGES="(none)"
@@ -126,7 +123,6 @@ jobs:
           PAYLOAD=${PAYLOAD//NEW_PLACEHOLDER/"$NEWROWS"}
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-      # --- Discord: failure
       - name: Notify Discord (failure)
         if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
         env:
