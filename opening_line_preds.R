@@ -250,18 +250,40 @@ avg3 <- function(a,b,c){
   (dplyr::coalesce(a,0)+dplyr::coalesce(b,0)+dplyr::coalesce(c,0)) / ifelse(n==0, NA_real_, n)
 }
 
-# ------------------------------------------------------------------------------
-# 1) DB connect + pull 2025 rows
-# ------------------------------------------------------------------------------
-con <- dbConnect(
-  RPostgres::Postgres(),
-  dbname   = "neondb",
-  host     = "ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech",
-  port     = 5432,
-  user     = "neondb_owner",
-  password = "npg_1d0oXImKqyJv",  # or Sys.getenv("NEON_PG_PASS")
-  sslmode  = "require"
-)
+connect_neon <- function() {
+  library(DBI); library(RPostgres); library(httr)
+  
+  url <- Sys.getenv("DATABASE_URL", unset = "")
+  if (nzchar(url)) {
+    pu <- httr::parse_url(url)
+    host <- pu$hostname
+    port <- as.integer(pu$port %||% 5432L)
+    db   <- sub("^/", "", pu$path %||% "")
+    user <- utils::URLdecode(pu$username %||% "")
+    pass <- utils::URLdecode(pu$password %||% "")
+    ssl  <- pu$query$sslmode %||% "require"
+  } else {
+    host <- Sys.getenv("PGHOST")
+    port <- as.integer(Sys.getenv("PGPORT", "5432"))
+    db   <- Sys.getenv("PGDATABASE")
+    user <- Sys.getenv("PGUSER")
+    pass <- Sys.getenv("PGPASSWORD")
+    ssl  <- Sys.getenv("PGSSLMODE", "require")
+  }
+  
+  stopifnot(nzchar(host), nzchar(db), nzchar(user), nzchar(pass))
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    host     = host,
+    port     = port,
+    dbname   = db,
+    user     = user,
+    password = pass,
+    sslmode  = ssl
+  )
+}
+
+con <- connect_neon()
 
 xgb_2025 <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season = 2025;')
 
@@ -1438,18 +1460,8 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK) {
   invisible(list(notified = sent, inserted = nrow(new_rows)))
 }
 
-# ------------------------------------------------------------------
-# 4) Run
-# ------------------------------------------------------------------
-con <- dbConnect(
-  RPostgres::Postgres(),
-  dbname   = "neondb",
-  host     = "ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech",
-  port     = 5432,
-  user     = "neondb_owner",
-  password = "npg_1d0oXImKqyJv",
-  sslmode  = "require"
-)
+con <- connect_neon()
+
 stopifnot(DBI::dbIsValid(con))
 res <- post_new_line_picks_to_discord(con, webhook = GAME_PICK_WEBHOOK)
 print(res)
