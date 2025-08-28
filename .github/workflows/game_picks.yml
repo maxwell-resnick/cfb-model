@@ -3,7 +3,7 @@ name: game_picks
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+    - cron: "0 8 * * *"   # nightly at 08:00 UTC (≈ 3am CDT / 2am CST)
 
 permissions:
   contents: read
@@ -26,13 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fast R + Posit Package Manager (binary CRAN)
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: '4.4.1'
           use-public-rspm: true
 
-      # Install & cache only the packages your script loads
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache: true
@@ -73,9 +71,8 @@ jobs:
 
       - name: Run opening_line_preds.R
         env:
-          # Your R script expects DISCORD_WEBHOOK; map from GAME_PICK_WEBHOOK
+          # Your R script checks this webhook env var
           DISCORD_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
-          # DATABASE_URL is still available if you later choose to read it in R
           DATABASE_URL:    ${{ env.DATABASE_URL }}
         shell: bash
         run: |
