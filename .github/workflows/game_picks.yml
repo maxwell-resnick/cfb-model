@@ -34,6 +34,9 @@ jobs:
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache: true
+          use-public-rspm: true
+          # 👇 add the SportsDataverse repo so oddsapiR can be found
+          extra-repositories: https://sportsdataverse.r-universe.dev
           packages: |
             any::DBI
             any::RPostgres
@@ -48,6 +51,11 @@ jobs:
             any::httr
             any::glmmTMB
             any::TMB
+            any::stringr
+            any::purrr
+            # 👇 install oddsapiR from the extra repo above
+            any::oddsapiR
+
 
       # Parse DATABASE_URL -> libpq env vars so RPostgres authenticates
       - name: Export DB env vars from DATABASE_URL
