@@ -3,7 +3,8 @@ name: game_picks
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *"   # nightly at 08:00 UTC (≈ 3am CDT / 2am CST)
+    # Nightly at 06:00 UTC (adjust as you like)
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -14,29 +15,29 @@ concurrency:
 
 jobs:
   run:
-    environment: manual-approval
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     env:
       DATABASE_URL:       ${{ secrets.DATABASE_URL }}
       GAME_PICK_WEBHOOK:  ${{ secrets.GAME_PICK_WEBHOOK }}
+      # If you store Odds API key as a secret, uncomment:
+      # ODDS_API_KEY:        ${{ secrets.ODDS_API_KEY }}
       R_KEEP_PKG_SOURCE:  no
 
     steps:
       - uses: actions/checkout@v4
 
+      # R with Posit Public Package Manager binaries
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: '4.4.1'
           use-public-rspm: true
 
+      # Install & cache CRAN packages your script loads (no comments here!)
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache: true
-          use-public-rspm: true
-          # 👇 add the SportsDataverse repo so oddsapiR can be found
-          extra-repositories: https://sportsdataverse.r-universe.dev
           packages: |
             any::DBI
             any::RPostgres
@@ -53,11 +54,14 @@ jobs:
             any::TMB
             any::stringr
             any::purrr
-            # 👇 install oddsapiR from the extra repo above
-            any::oddsapiR
 
+      # Install oddsapiR from SportsDataverse R-Universe (not CRAN)
+      - name: Install oddsapiR (R-Universe)
+        shell: bash
+        run: |
+          Rscript -e 'install.packages("oddsapiR", repos=c("https://sportsdataverse.r-universe.dev","https://cloud.r-project.org"))'
 
-      # Parse DATABASE_URL -> libpq env vars so RPostgres authenticates
+      # Parse DATABASE_URL into libpq env vars for RPostgres
       - name: Export DB env vars from DATABASE_URL
         shell: bash
         run: |
@@ -78,11 +82,10 @@ jobs:
           PY
 
       - name: Run opening_line_preds.R
-        env:
-          # Your R script checks this webhook env var
-          DISCORD_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
-          DATABASE_URL:    ${{ env.DATABASE_URL }}
         shell: bash
+        env:
+          # Your script reads GAME_PICK_WEBHOOK already; pass through just in case.
+          GAME_PICK_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
         run: |
           set -o pipefail
           Rscript --vanilla opening_line_preds.R 2>&1 | tee r_run.log
@@ -95,7 +98,7 @@ jobs:
           path: r_run.log
           retention-days: 7
 
-      # Fallback Discord alert on workflow failure (your R script posts success)
+      # Fallback Discord alert if the workflow fails before the script posts anything
       - name: Notify Discord on failure
         if: failure() && env.GAME_PICK_WEBHOOK != ''
         env:
@@ -110,7 +113,7 @@ jobs:
             "embeds":[
               {
                 "title":"❌ opening_line_preds failed",
-                "description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.",
+                "description":"Branch: **${{ github.ref_name }}**\\nSee run logs for details.",
                 "url":"RUN_URL_PLACEHOLDER",
                 "timestamp":"NOW_PLACEHOLDER",
                 "color":15158332
@@ -122,4 +125,5 @@ jobs:
           payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           payload=${payload//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
+
 
