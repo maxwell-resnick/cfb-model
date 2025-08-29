@@ -1312,38 +1312,53 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
   stopifnot(DBI::dbIsValid(con))
   ensure_lines_seen_table(con)
   
-  now_utc <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
-  notify_none <- function() {
-    if (!notify_when_none || !nzchar(webhook)) return(FALSE)
+  # fallback for `%||%` (dplyr/rlang style)
+  if (!exists("%||%", mode = "function")) {
+    `%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || (is.atomic(x) && all(is.na(x)))) y else x
+  }
+  
+  # simple Discord sender guard
+  if (!exists("send_discord", mode = "function")) {
+    stop("send_discord() is not defined in this session.")
+  }
+  
+  now_utc <- format(as.POSIXct(Sys.time(), tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ")
+  
+  notify_none <- function(reason = "(unspecified)") {
+    if (!notify_when_none) {
+      message("No-new-lines notification suppressed (notify_when_none = FALSE). Reason: ", reason)
+      return(FALSE)
+    }
+    if (!nzchar(webhook)) {
+      message("No-new-lines NOT sent: empty webhook. Reason: ", reason)
+      return(FALSE)
+    }
     embed <- list(
       title = "No new lines!",
-      description = paste0("No previously-NA lines turned non-NA as of ", now_utc, " (UTC)."),
+      description = paste0("No previously-NA lines turned non-NA as of ", now_utc, " (UTC).\nReason: ", reason),
       color = 0x95A5A6
     )
-    ok <- send_discord(webhook, embeds = list(embed))
+    ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
+    message(if (ok) "Sent 'No new lines' notice." else "Failed to send 'No new lines' notice.")
     invisible(ok)
   }
   
-  # Which columns exist right now?
   gp_cols <- DBI::dbGetQuery(
     con,
     "SELECT column_name FROM information_schema.columns
      WHERE table_schema='public' AND table_name='GamePicks'"
   )$column_name
   
-  # Lines we watch (only those present)
   line_cols_all <- c(
     "dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread",
     "dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder"
   )
   line_cols <- intersect(line_cols_all, gp_cols)
-  
   if (!length(line_cols)) {
-    sent <- notify_none()
+    sent <- notify_none("No watched line columns present in GamePicks.")
     return(invisible(list(notified = as.integer(sent), inserted = 0L)))
   }
   
-  # Pick/pred columns for messages (only pull if present)
   pick_cols_all <- c(
     "spread_pick","best_book","pick_margin","spread_unit",
     "ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit",
@@ -1351,50 +1366,44 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
   )
   pick_cols <- intersect(pick_cols_all, gp_cols)
   
-  # Pull GamePicks rows with everything we might need
   sel_cols <- unique(c("id", line_cols, pick_cols))
   q_cols   <- paste(sprintf('"%s"', sel_cols), collapse = ", ")
   gp <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "GamePicks";', q_cols))
   
-  # Long-ify current non-NA lines
-  cur_long <- gp %>%
+  cur_long <- gp |>
     tidyr::pivot_longer(
       cols = tidyselect::all_of(line_cols),
       names_to = "field",
       values_to = "line"
-    ) %>%
-    dplyr::filter(!is.na(line)) %>%
+    ) |>
+    dplyr::filter(!is.na(line)) |>
     dplyr::select(id, field, line)
   
   if (!nrow(cur_long)) {
-    sent <- notify_none()
+    sent <- notify_none("There are no currently non-NA lines.")
     return(invisible(list(notified = as.integer(sent), inserted = 0L)))
   }
   
-  # What have we already announced?
   seen <- DBI::dbGetQuery(con, 'SELECT id, field FROM "GamePicksLineSeen";')
   
-  # Newly non-NA = present now but not in seen
-  new_rows <- cur_long %>% dplyr::anti_join(seen, by = c("id","field"))
+  new_rows <- dplyr::anti_join(cur_long, seen, by = c("id","field"))
   if (!nrow(new_rows)) {
-    sent <- notify_none()
+    sent <- notify_none("All current non-NA lines were already announced.")
     return(invisible(list(notified = as.integer(sent), inserted = 0L)))
   }
   
-  # Determine which game IDs have new spreads vs new totals
-  new_spread_ids <- new_rows %>% dplyr::filter(grepl("spread", field))    %>% dplyr::pull(id) %>% unique()
-  new_total_ids  <- new_rows %>% dplyr::filter(grepl("overunder", field)) %>% dplyr::pull(id) %>% unique()
+  new_spread_ids <- new_rows |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique()
+  new_total_ids  <- new_rows |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique()
   
-  # Helper: plus formatting (expects to already exist in your script; define here if not)
   if (!exists("plus", mode = "function")) {
     plus <- function(x, dig = 2) {
       ifelse(is.na(x), "NA",
-             ifelse(x >= 0, paste0("+", format(round(x, dig), nsmall = dig)),
-                    format(round(x, dig), nsmall = dig)))
+             ifelse(suppressWarnings(as.numeric(x)) >= 0,
+                    paste0("+", format(round(as.numeric(x), dig), nsmall = dig)),
+                    format(round(as.numeric(x), dig), nsmall = dig)))
     }
   }
   
-  # Helper: flatten a data.frame to Discord embed fields (expects make_fields in your script; define fallback)
   if (!exists("make_fields", mode = "function")) {
     make_fields <- function(df) {
       if (!nrow(df)) return(list())
@@ -1402,17 +1411,15 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
     }
   }
   
-  # Build spread items (ordered by spread_unit desc, then pick_margin desc)
   spreads_fields <- list()
   if (length(new_spread_ids)) {
-    cols_needed <- c("id","season","week","team","opponent","spread_pick","best_book","pick_margin","spread_unit")
-    cols_needed <- intersect(cols_needed, names(gp))
+    cols_needed <- intersect(c("id","season","week","team","opponent","spread_pick","best_book","pick_margin","spread_unit"), names(gp))
     if (length(cols_needed)) {
-      df <- gp %>%
-        dplyr::filter(id %in% new_spread_ids) %>%
-        dplyr::select(dplyr::all_of(cols_needed)) %>%
+      df <- gp |>
+        dplyr::filter(id %in% new_spread_ids) |>
+        dplyr::select(dplyr::all_of(cols_needed)) |>
         dplyr::mutate(
-          spread_unit = as.integer(spread_unit),
+          spread_unit = suppressWarnings(as.integer(spread_unit)),
           pick_margin = suppressWarnings(as.numeric(pick_margin)),
           title = sprintf("SPREAD — %s vs %s (Wk %s, %s)",
                           team %||% "NA", opponent %||% "NA",
@@ -1422,23 +1429,21 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
                           best_book %||% "NA",
                           plus(pick_margin, 2),
                           ifelse(is.na(spread_unit), "NA", as.character(spread_unit)))
-        ) %>%
+        ) |>
         dplyr::transmute(name = title, value = value, inline = FALSE)
       spreads_fields <- make_fields(df)
     }
   }
   
-  # Build total items (ordered by ou_unit desc, then ou_pick_margin desc)
   totals_fields <- list()
   if (length(new_total_ids)) {
-    cols_needed <- c("id","season","week","team","opponent","ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit")
-    cols_needed <- intersect(cols_needed, names(gp))
+    cols_needed <- intersect(c("id","season","week","team","opponent","ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit"), names(gp))
     if (length(cols_needed)) {
-      df <- gp %>%
-        dplyr::filter(id %in% new_total_ids) %>%
-        dplyr::select(dplyr::all_of(cols_needed)) %>%
+      df <- gp |>
+        dplyr::filter(id %in% new_total_ids) |>
+        dplyr::select(dplyr::all_of(cols_needed)) |>
         dplyr::mutate(
-          ou_unit        = as.integer(ou_unit),
+          ou_unit        = suppressWarnings(as.integer(ou_unit)),
           ou_pick_margin = suppressWarnings(as.numeric(ou_pick_margin)),
           title = sprintf("TOTAL — %s vs %s (Wk %s, %s)",
                           team %||% "NA", opponent %||% "NA",
@@ -1451,7 +1456,7 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
                           best_ou_book %||% "NA",
                           plus(ou_pick_margin, 2),
                           ifelse(is.na(ou_unit), "NA", as.character(ou_unit)))
-        ) %>%
+        ) |>
         dplyr::transmute(name = title, value = value, inline = FALSE)
       totals_fields <- make_fields(df)
     }
@@ -1459,14 +1464,11 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
   
   fields_all <- c(spreads_fields, totals_fields)
   if (!length(fields_all)) {
-    # Edge-case: we had new_rows, but we couldn't build fields (unlikely). Still notify none.
-    sent <- notify_none()
+    sent <- notify_none("New lines detected but no pick fields could be constructed.")
     return(invisible(list(notified = as.integer(sent), inserted = nrow(new_rows))))
   }
   
-  # Chunk into batches of 10 fields per embed/message
   batches <- split(fields_all, ceiling(seq_along(fields_all) / 10))
-  
   sent <- 0L
   for (i in seq_along(batches)) {
     embed <- list(
@@ -1475,17 +1477,16 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
       color = 0x3498db,
       fields = batches[[i]]
     )
-    ok <- send_discord(webhook, embeds = list(embed))
+    ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
     if (ok) sent <- sent + length(batches[[i]])
     Sys.sleep(0.2)
   }
   
-  # Mark these specific (id, field) as seen so we don't alert again
   stage_name <- DBI::Id(schema = NULL, table = "GamePicksLineSeen_stage")
   if (DBI::dbExistsTable(con, stage_name)) DBI::dbRemoveTable(con, stage_name)
   DBI::dbWriteTable(
     con, stage_name,
-    new_rows %>% dplyr::mutate(first_value = as.numeric(line)) %>% dplyr::select(id, field, first_value),
+    new_rows |> dplyr::mutate(first_value = suppressWarnings(as.numeric(line))) |> dplyr::select(id, field, first_value),
     temporary = TRUE, overwrite = TRUE
   )
   
@@ -1502,6 +1503,12 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
   
   invisible(list(notified = sent, inserted = nrow(new_rows)))
 }
+
+con <- connect_neon()
+
+stopifnot(DBI::dbIsValid(con))
+res <- post_new_line_picks_to_discord(con, webhook = GAME_PICK_WEBHOOK)
+print(res)
 
 
 
