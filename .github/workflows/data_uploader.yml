@@ -3,16 +3,16 @@ name: data_uploader_daily
 on:
   workflow_dispatch:
   schedule:
-    # 08:00–22:00 ET (EDT = UTC-4) -> 12:00–02:00 UTC
+    # 08:00–22:00 ET (EDT=UTC-4) => 12:00–02:00 UTC
     - cron: '0 12-23,0-2 * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      BEARER_TOKEN:   ${{ secrets.BEARER_TOKEN }}
-      DATABASE_URL:   ${{ secrets.DATABASE_URL }}
-      DISCORD_WEBHOOK:${{ secrets.DISCORD_WEBHOOK }}
+      BEARER_TOKEN:     ${{ secrets.BEARER_TOKEN }}
+      DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+      DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,6 @@ jobs:
           UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
           UPS=${UPS:-0}
           echo "upserted=$UPS" >> $GITHUB_OUTPUT
-          echo "Parsed Upserted rows: $UPS"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -51,7 +50,6 @@ jobs:
           path: uploader.log
           retention-days: 7
 
-      # Discord: success
       - name: Notify Discord (success)
         if: success() && env.DISCORD_WEBHOOK != ''
         env:
@@ -75,7 +73,6 @@ jobs:
           payload=${payload//NEW_PLACEHOLDER/"$NEWROWS"}
           curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
 
-      # Discord: failure
       - name: Notify Discord (failure)
         if: failure() && env.DISCORD_WEBHOOK != ''
         env:

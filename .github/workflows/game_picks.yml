@@ -1,107 +1,90 @@
-name: game_picks
+name: data_uploader_daily
 
 on:
   workflow_dispatch:
   schedule:
-    # 08:15–22:15 ET == 12:15–02:15 UTC (EDT)
-    - cron: '15 12-23,0-2 * * *'
-
-permissions:
-  contents: read
-
-concurrency:
-  group: game_picks-${{ github.ref }}
-  cancel-in-progress: false
+    # 08:00–22:00 ET (EDT=UTC-4) => 12:00–02:00 UTC
+    - cron: '0 12-23,0-2 * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     env:
-      DATABASE_URL:      ${{ secrets.DATABASE_URL }}
-      GAME_PICK_WEBHOOK: ${{ secrets.GAME_PICK_WEBHOOK }}
-      R_KEEP_PKG_SOURCE: no
+      BEARER_TOKEN:     ${{ secrets.BEARER_TOKEN }}
+      DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+      DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: r-lib/actions/setup-r@v2
+      - uses: actions/setup-python@v5
         with:
-          r-version: '4.4.1'
-          use-public-rspm: true
+          python-version: "3.11"
 
-      - uses: r-lib/actions/setup-r-dependencies@v2
-        with:
-          cache: true
-          packages: |
-            any::DBI
-            any::RPostgres
-            any::dplyr
-            any::tidyr
-            any::glue
-            any::qs
-            any::xgboost
-            any::slider
-            any::lubridate
-            any::jsonlite
-            any::httr
-            any::glmmTMB
-            any::TMB
-            any::stringr
-            any::purrr
-
-      - name: Install oddsapiR (R-Universe)
-        shell: bash
+      - name: Install deps
         run: |
-          Rscript -e 'install.packages("oddsapiR", repos=c("https://sportsdataverse.r-universe.dev","https://cloud.r-project.org"))'
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install cfbd pandas numpy SQLAlchemy pg8000 python-dotenv certifi filelock
+          fi
 
-      - name: Export DB env vars from DATABASE_URL
-        shell: bash
-        run: |
-          python - <<'PY' >> "$GITHUB_ENV"
-          import os
-          from urllib.parse import urlparse
-          url = os.environ.get("DATABASE_URL", "")
-          if not url:
-              raise SystemExit("DATABASE_URL is missing")
-          u = urlparse(url)
-          print(f"PGHOST={u.hostname}")
-          print(f"PGPORT={u.port or 5432}")
-          print(f"PGDATABASE={u.path.lstrip('/')}")
-          print(f"PGUSER={u.username}")
-          print(f"PGPASSWORD={u.password}")
-          print(f"NEON_PG_PASS={u.password}")
-          PY
-
-      - name: Run opening_line_preds.R
-        shell: bash
-        env:
-          GAME_PICK_WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
+      - name: Run uploader
+        id: run_uploader
         run: |
           set -o pipefail
-          Rscript --vanilla opening_line_preds.R 2>&1 | tee r_run.log
+          python data_uploader.py 2>&1 | tee uploader.log
 
-      - name: Upload run log
+      - name: Parse upsert count
+        id: stats
+        run: |
+          UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
+          UPS=${UPS:-0}
+          echo "upserted=$UPS" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: r-run-log
-          path: r_run.log
+          name: uploader-log
+          path: uploader.log
           retention-days: 7
 
-      - name: Notify Discord on failure
-        if: failure() && env.GAME_PICK_WEBHOOK != ''
+      - name: Notify Discord (success)
+        if: success() && env.DISCORD_WEBHOOK != ''
         env:
-          WEBHOOK: ${{ env.GAME_PICK_WEBHOOK }}
-        shell: bash
+          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          UPS="${{ steps.stats.outputs.upserted }}"
+          CHANGES=$(grep -E '^DISCORD_DIFF ' uploader.log | sed 's/^DISCORD_DIFF //' | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          NEWROWS=$(grep -E '^DISCORD_NEW ' uploader.log  | sed 's/^DISCORD_NEW //'  | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
+          [ -z "$CHANGES" ] && CHANGES="(none)"
+          [ -z "$NEWROWS" ] && NEWROWS="(none)"
+          payload=$(cat <<'JSON'
+          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
+          JSON
+          )
+          payload=${payload//UPS_PLACEHOLDER/"$UPS"}
+          payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          payload=${payload//NOW_PLACEHOLDER/"$NOW"}
+          payload=${payload//CHANGES_PLACEHOLDER/"$CHANGES"}
+          payload=${payload//NEW_PLACEHOLDER/"$NEWROWS"}
+          curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
+
+      - name: Notify Discord (failure)
+        if: failure() && env.DISCORD_WEBHOOK != ''
+        env:
+          WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           payload=$(cat <<'JSON'
-          {"username":"OpeningLine Bot","embeds":[{"title":"❌ opening_line_preds failed","description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":15158332}]}
+          {"username":"CFB Uploader","embeds":[{"title":"❌ data_uploader failed","description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":15158332}]}
           JSON
           )
           payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
           payload=${payload//NOW_PLACEHOLDER/"$NOW"}
           curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
+
