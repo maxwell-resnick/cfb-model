@@ -650,35 +650,27 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 
 model_df = build_model_data(combined_df)
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import ssl
+import sys
+import pandas as pd
+from sqlalchemy import create_engine, inspect, text
+
+# ----------------------------- CONFIG ---------------------------------
 TABLE = "PreparedData"
 KEYS  = ["id", "team", "opponent"]
 
-DATABASE_URL = (
-    "postgresql+pg8000://neondb_owner:npg_1d0oXImKqyJv"
-    "@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb"
-)
+# model_df must already be defined upstream
+# e.g., from data assembly code: model_df = build_model_data(combined_df)
 
-# model_df must already exist at this point
-# model_df = build_model_data(combined_df)
-
-# ---------- CONNECT ----------
-engine = create_engine(
-   DATABASE_URL,
-   pool_pre_ping=True,
-   connect_args={"ssl_context": ssl.create_default_context()},
-)
-
-# ---------- OPTIONAL: ensure helper stamp column exists ----------
-with engine.begin() as conn:
-    conn.execute(text(
-        'ALTER TABLE "PreparedData" '
-        'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
-    ))
-
-# ---------- Canonicalization rules (stable diffs) ----------
+# Canonicalization rules (stable diffs)
 DEFAULT_TEXT_COLS = [
     "seasonType","startDate","team","opponent","homeTeam","awayTeam",
-    "homeConference","awayConference","homeClassification","awayClassification","provider"
+    "homeConference","awayConference","homeClassification","awayClassification","provider",
 ]
 DEFAULT_DATE_COLS = ["startDate"]
 DEFAULT_NUM_COLS = [
@@ -690,12 +682,14 @@ DEFAULT_NUM_COLS = [
     "draftkings_spread","draftkings_opening_spread","draftkings_overunder","draftkings_opening_overunder",
     "espnbet_spread","espnbet_opening_spread","espnbet_overunder","espnbet_opening_overunder",
     "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
-    "neutralSite","conferenceGame","homeId","awayId","id"
+    "neutralSite","conferenceGame","homeId","awayId","id",
 ]
-
 IGNORE_FOR_DIFF = {"startDate"}
 
+# ------------------------ HELPER FUNCTIONS ----------------------------
+
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a slice for stable equality/diff checks."""
     x = df_slice.copy()
 
     # TEXT: trim, empty -> NA (use pandas string dtype for safe .str ops)
@@ -707,7 +701,7 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
         epoch = (dt.view("int64") // 1_000_000_000)
-        x[c] = pd.Series(epoch).astype("Int64")
+        x[c] = pd.Series(epoch, index=x.index).astype("Int64")
 
     # NUMERICS: coerce + round for stable diffs
     for c in (set(DEFAULT_NUM_COLS) & set(x.columns)):
@@ -715,164 +709,210 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
-# ---------- 1) Discover DB columns & choose common cols ----------
-with engine.connect() as conn:
-    cols_in_db = {c["name"] for c in inspect(conn).get_columns(TABLE, schema="public")}
 
-# Only work with intersection to avoid schema drift
-common_cols = [c for c in model_df.columns if c in cols_in_db]
-for k in KEYS:
-    if k not in common_cols:
-        common_cols.append(k)
-
-# ---------- 2) Read ALL rows from DB for those columns ----------
-read_cols = [c for c in common_cols if c in cols_in_db]
-cols_sql  = ", ".join(f'"{c}"' for c in read_cols)
-
-with engine.connect() as conn:
-    db_df = pd.read_sql(text(f'SELECT {cols_sql} FROM "{TABLE}"'), conn)
-
-# ---------- 3) Align frames ----------
-model_trim = model_df[common_cols].copy()
-db_trim    = db_df[[c for c in common_cols if c in db_df.columns]].copy() if not db_df.empty else pd.DataFrame(columns=common_cols)
-
-# Index by composite key
-model_idx = model_trim.set_index(KEYS, drop=False)
-db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
-
-# ---------- 4) Detect NEW rows ----------
-new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
-
-changed_rows = pd.DataFrame(columns=common_cols)
-diff_summary = {}
-
-if not db_trim.empty and not model_trim.empty:
-    common_index = model_idx.index.intersection(db_idx.index)
-    if len(common_index):
-        nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
-        modN = canon(model_idx.loc[common_index, nonkey_cols])
-        dbN  = canon(db_idx.loc[common_index, nonkey_cols])
-
-        # cell-wise equality (after canon)
-        eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
-
-        # --- count changes by column, excluding ignored columns (e.g., startDate)
-        diff_summary = {c: int((~eq[c]).sum())
-                        for c in modN.columns
-                        if c not in IGNORE_FOR_DIFF}
-
-        # --- treat ignored columns as equal so startDate-only diffs don't flag a row
-        eq_ignore = eq.copy()
-        for c in (set(IGNORE_FOR_DIFF) & set(eq.columns)):
-            eq_ignore[c] = True
-
-        # rows changed in at least one NON-ignored column
-        changed_keys = eq_ignore.all(axis=1).index[~eq_ignore.all(axis=1)]
-        if len(changed_keys):
-            changed_rows = model_idx.loc[changed_keys, common_cols].copy()
-
-print(f"NEW rows: {len(new_rows)}")
-print(f"CHANGED rows (after normalization): {len(changed_rows)}")
-
-if diff_summary:
-    nz = {k: v for k, v in diff_summary.items() if v and k not in IGNORE_FOR_DIFF}
-    if nz:
-        print("Changed cells by column (non-zero only):", nz)
-
-# --- NEW: print per-row diffs for Discord, ignoring startDate-only diffs ---
 def _fmt(v):
     if pd.isna(v):
         return "NA"
     s = str(v).replace("\n", " ")
     return (s[:80] + "…") if len(s) > 81 else s
 
-if not db_trim.empty and not model_trim.empty and 'eq' in locals():
-    nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
-    # rows that differ in at least one column (by canonical comparison)
-    changed_keys_idx = eq.all(axis=1).index[~eq.all(axis=1)]
-    for idx in changed_keys_idx:
-        # which columns changed (by canonical eq) and are not ignored
-        ch_cols = [c for c in nonkey_cols
-                   if (c in eq.columns and not eq.loc[idx, c] and c not in IGNORE_FOR_DIFF)]
-        if not ch_cols:
-            # only ignored columns (e.g., startDate) changed -> skip this row
-            continue
-        parts = []
-        for c in ch_cols:
-            old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
-            new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
-            parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
-        gid, gteam, gopp = idx  # composite key
-        print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
 
-# Print NEW rows (keys only) so YAML can include them too
-if not new_rows.empty:
-    for r in new_rows.itertuples(index=False):
-        print("DISCORD_NEW", f"id={getattr(r, 'id', 'NA')} team={getattr(r, 'team', 'NA')} opponent={getattr(r, 'opponent', 'NA')}")
+def _param_name(col: str) -> str:
+    # safe param names for dotted columns
+    return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
 
-# ---------- 6) UPSERT (INSERT new + UPDATE changed) ----------
-to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
 
-if to_upsert.empty:
-    print("No new/changed rows to upsert.")
-else:
-    cols_for_insert = [c for c in common_cols if c != "date_updated"]  # let DB default on INSERT
-    update_cols     = [c for c in cols_for_insert if c not in KEYS]
+# ------------------------------ MAIN ----------------------------------
 
-    def _param_name(col: str) -> str:
-        # safe param names for dotted columns
-        return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
+def main(model_df: pd.DataFrame) -> None:
+    # 1) Read DATABASE_URL from env (no hard-coding)
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL env var is not set. Configure it in your environment/CI secrets."
+        )
 
-    param_map = {c: _param_name(c) for c in cols_for_insert}
-    cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
-    vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
-    set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
+    # 2) Create engine (Neon requires SSL)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={"ssl_context": ssl.create_default_context()},
+    )
 
-    upsert_sql = text(f'''
-        INSERT INTO "{TABLE}" ({cols_q})
-        VALUES ({vals_q})
-        ON CONFLICT ("id","team","opponent") DO UPDATE
-        SET {set_q};
-    ''')
+    # 2a) Smoke test connection (fail fast with clear error)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        raise RuntimeError(f"DB connectivity check failed: {e}") from e
 
-    recs = []
-    for _, row in to_upsert[cols_for_insert].iterrows():
-        d = {}
-        for c in cols_for_insert:
-            v = row[c]
-            d[param_map[c]] = None if pd.isna(v) else v
-        recs.append(d)
-
-    CHUNK = 500
+    # 3) Ensure helper column exists
     with engine.begin() as conn:
-        for i in range(0, len(recs), CHUNK):
-            conn.execute(upsert_sql, recs[i:i+CHUNK])
+        conn.execute(text(
+            'ALTER TABLE "PreparedData" '
+            'ADD COLUMN IF NOT EXISTS date_updated timestamptz NOT NULL DEFAULT now();'
+        ))
 
-    print(f"Upserted rows: {len(to_upsert)}")
+    # 4) Discover DB columns
+    with engine.connect() as conn:
+        cols_in_db = {c["name"] for c in inspect(conn).get_columns(TABLE, schema="public")}
 
-# ---------- 7) (Optional) Ensure PK exists on (id, team, opponent) ----------
-with engine.begin() as conn:
-    # add NOT NULLs first (safe if already set)
-    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "id"       SET NOT NULL;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "team"     SET NOT NULL;'))
-    conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "opponent" SET NOT NULL;'))
+    if model_df is None or model_df.empty:
+        print("model_df is empty; nothing to sync.")
+        return
 
-    # create PK if missing
-    conn.execute(text('''
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint c
-        JOIN pg_class t ON c.conrelid = t.oid
-        JOIN pg_namespace n ON t.relnamespace = n.oid
-        WHERE t.relname = 'PreparedData'
-          AND n.nspname = 'public'
-          AND c.contype = 'p'
-      ) THEN
-        ALTER TABLE "PreparedData"
-        ADD CONSTRAINT prepareddata_pk PRIMARY KEY ("id","team","opponent");
-      END IF;
-    END$$;
-    '''))
+    # Only work with intersection to avoid schema drift; ensure KEYS present
+    common_cols = [c for c in model_df.columns if c in cols_in_db]
+    for k in KEYS:
+        if k not in common_cols:
+            common_cols.append(k)
 
-print("Sync complete.")
+    # 5) Read all rows from DB for those columns
+    read_cols = [c for c in common_cols if c in cols_in_db]
+    cols_sql  = ", ".join(f'"{c}"' for c in read_cols)
+
+    with engine.connect() as conn:
+        db_df = pd.read_sql(text(f'SELECT {cols_sql} FROM "{TABLE}"'), conn)
+
+    # 6) Align frames
+    model_trim = model_df[common_cols].copy()
+    db_trim = (
+        db_df[[c for c in common_cols if c in db_df.columns]].copy()
+        if not db_df.empty else pd.DataFrame(columns=common_cols)
+    )
+
+    # Index by composite key
+    model_idx = model_trim.set_index(KEYS, drop=False)
+    db_idx    = db_trim.set_index(KEYS, drop=False) if not db_trim.empty else db_trim
+
+    # 7) NEW rows
+    new_rows = model_trim.loc[~model_idx.index.isin(db_idx.index)].copy()
+
+    changed_rows = pd.DataFrame(columns=common_cols)
+    diff_summary = {}
+
+    # 8) Changed rows via canonical comparison
+    if not db_trim.empty and not model_trim.empty:
+        common_index = model_idx.index.intersection(db_idx.index)
+        if len(common_index):
+            nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
+            modN = canon(model_idx.loc[common_index, nonkey_cols])
+            dbN  = canon(db_idx.loc[common_index, nonkey_cols])
+
+            # cell-wise equality (after canon)
+            eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
+
+            # count changes by column, excluding ignored columns
+            diff_summary = {
+                c: int((~eq[c]).sum())
+                for c in modN.columns
+                if c not in IGNORE_FOR_DIFF
+            }
+
+            # treat ignored columns as equal so startDate-only diffs don't flag a row
+            eq_ignore = eq.copy()
+            for c in (set(IGNORE_FOR_DIFF) & set(eq.columns)):
+                eq_ignore[c] = True
+
+            # rows changed in at least one NON-ignored column
+            changed_keys_idx = eq_ignore.all(axis=1).index[~eq_ignore.all(axis=1)]
+            if len(changed_keys_idx):
+                changed_rows = model_idx.loc[changed_keys_idx, common_cols].copy()
+
+    print(f"NEW rows: {len(new_rows)}")
+    print(f"CHANGED rows (after normalization): {len(changed_rows)}")
+
+    if diff_summary:
+        nz = {k: v for k, v in diff_summary.items() if v and k not in IGNORE_FOR_DIFF}
+        if nz:
+            print("Changed cells by column (non-zero only):", nz)
+
+    # 9) Discord-friendly per-row diffs (ignoring startDate-only)
+    if not db_trim.empty and not model_trim.empty and 'eq' in locals():
+        nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
+        all_changed_idx = eq.all(axis=1).index[~eq.all(axis=1)]
+        for idx in all_changed_idx:
+            ch_cols = [
+                c for c in nonkey_cols
+                if (c in eq.columns and not eq.loc[idx, c] and c not in IGNORE_FOR_DIFF)
+            ]
+            if not ch_cols:
+                continue  # only ignored columns changed
+            parts = []
+            for c in ch_cols:
+                old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
+                new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
+                parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
+            gid, gteam, gopp = idx  # composite key (id, team, opponent)
+            print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
+
+    # Print NEW rows (keys only)
+    if not new_rows.empty:
+        for r in new_rows.itertuples(index=False):
+            print(
+                "DISCORD_NEW",
+                f"id={getattr(r, 'id', 'NA')} team={getattr(r, 'team', 'NA')} opponent={getattr(r, 'opponent', 'NA')}",
+            )
+
+    # 10) UPSERT (INSERT new + UPDATE changed)
+    to_upsert = pd.concat([new_rows, changed_rows], ignore_index=True).drop_duplicates(subset=KEYS)
+
+    if to_upsert.empty:
+        print("No new/changed rows to upsert.")
+    else:
+        cols_for_insert = [c for c in common_cols if c != "date_updated"]  # let DB default on INSERT
+        update_cols     = [c for c in cols_for_insert if c not in KEYS]
+
+        param_map = {c: _param_name(c) for c in cols_for_insert}
+        cols_q = ", ".join(f'"{c}"' for c in cols_for_insert)
+        vals_q = ", ".join(f':{param_map[c]}' for c in cols_for_insert)
+        set_q  = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols] + ['"date_updated" = now()'])
+
+        upsert_sql = text(f'''
+            INSERT INTO "{TABLE}" ({cols_q})
+            VALUES ({vals_q})
+            ON CONFLICT ("id","team","opponent") DO UPDATE
+            SET {set_q};
+        ''')
+
+        recs = []
+        for _, row in to_upsert[cols_for_insert].iterrows():
+            d = {}
+            for c in cols_for_insert:
+                v = row[c]
+                d[param_map[c]] = None if pd.isna(v) else v
+            recs.append(d)
+
+        CHUNK = 500
+        with engine.begin() as conn:
+            for i in range(0, len(recs), CHUNK):
+                conn.execute(upsert_sql, recs[i:i+CHUNK])
+
+        print(f"Upserted rows: {len(to_upsert)}")
+
+    # 11) Ensure PK exists on (id, team, opponent)
+    with engine.begin() as conn:
+        # add NOT NULLs first (safe if already set)
+        conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "id"       SET NOT NULL;'))
+        conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "team"     SET NOT NULL;'))
+        conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "opponent" SET NOT NULL;'))
+
+        # create PK if missing
+        conn.execute(text('''
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE t.relname = 'PreparedData'
+              AND n.nspname = 'public'
+              AND c.contype = 'p'
+          ) THEN
+            ALTER TABLE "PreparedData"
+            ADD CONSTRAINT prepareddata_pk PRIMARY KEY ("id","team","opponent");
+          END IF;
+        END$$;
+        '''))
+
+    print("Sync complete.")
