@@ -2,56 +2,26 @@ name: data_uploader_daily
 
 on:
   workflow_dispatch:
-    inputs:
-      force_run:
-        description: 'Bypass NY time gate (true/false)'
-        required: false
-        default: 'false'
-      simulate_failure:
-        description: 'Force a failure to test notifications (true/false)'
-        required: false
-        default: 'false'
   schedule:
-    - cron: "0 * * * *"  # run hourly in UTC; time gate below enforces 08–22 America/New_York
+    # 08:00–22:00 ET (EDT = UTC-4) -> 12:00–02:00 UTC
+    - cron: '0 12-23,0-2 * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-      FORCE_RUN: ${{ github.event.inputs.force_run }}
-      SIM_FAIL:  ${{ github.event.inputs.simulate_failure }}
+      BEARER_TOKEN:   ${{ secrets.BEARER_TOKEN }}
+      DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+      DISCORD_WEBHOOK:${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
-      - name: Time gate (run only 08–22 America/New_York, unless forced)
-        id: timegate
-        run: |
-          if [ "${FORCE_RUN}" = "true" ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-            echo "Force-run enabled; skipping time window check."
-            exit 0
-          fi
-          HOUR_NY=$(TZ=America/New_York date +%H)
-          echo "Local NY hour: $HOUR_NY"
-          if [ "$HOUR_NY" -ge 8 ] && [ "$HOUR_NY" -le 22 ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-          else
-            echo "run=false" >> $GITHUB_OUTPUT
-            echo "Outside 08–22 NY window. Skipping."
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.timegate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.timegate.outputs.run == 'true'
         with:
           python-version: "3.11"
 
       - name: Install deps
-        if: steps.timegate.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -61,14 +31,12 @@ jobs:
           fi
 
       - name: Run uploader
-        if: steps.timegate.outputs.run == 'true'
         id: run_uploader
         run: |
           set -o pipefail
           python data_uploader.py 2>&1 | tee uploader.log
 
       - name: Parse upsert count
-        if: steps.timegate.outputs.run == 'true'
         id: stats
         run: |
           UPS=$(grep -Eo 'Upserted rows: [0-9]+' uploader.log | awk '{print $3}' | tail -1)
@@ -83,14 +51,9 @@ jobs:
           path: uploader.log
           retention-days: 7
 
-      - name: Simulate failure (for testing notifications)
-        if: steps.timegate.outputs.run == 'true' && env.SIM_FAIL == 'true'
-        run: |
-          echo "Simulating failure as requested." >&2
-          exit 1
-
+      # Discord: success
       - name: Notify Discord (success)
-        if: steps.timegate.outputs.run == 'true' && success() && env.DISCORD_WEBHOOK != ''
+        if: success() && env.DISCORD_WEBHOOK != ''
         env:
           WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
         run: |
@@ -101,39 +64,29 @@ jobs:
           NEWROWS=$(grep -E '^DISCORD_NEW ' uploader.log  | sed 's/^DISCORD_NEW //'  | tail -n 12 | sed 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
           [ -z "$CHANGES" ] && CHANGES="(none)"
           [ -z "$NEWROWS" ] && NEWROWS="(none)"
-          PAYLOAD=$(cat <<'JSON'
-          {
-            "username":"CFB Uploader",
-            "embeds":[
-              {
-                "title":"✅ data_uploader succeeded",
-                "description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```",
-                "url":"RUN_URL_PLACEHOLDER",
-                "timestamp":"NOW_PLACEHOLDER",
-                "color":3066993
-              }
-            ]
-          }
+          payload=$(cat <<'JSON'
+          {"username":"CFB Uploader","embeds":[{"title":"✅ data_uploader succeeded","description":"Branch: **${{ github.ref_name }}**\nUpserted rows: **UPS_PLACEHOLDER**\n\n**Changes (tail)**\n```CHANGES_PLACEHOLDER```\n**New rows (tail)**\n```NEW_PLACEHOLDER```","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":3066993}]}
           JSON
           )
-          PAYLOAD=${PAYLOAD//UPS_PLACEHOLDER/"$UPS"}
-          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
-          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
-          PAYLOAD=${PAYLOAD//CHANGES_PLACEHOLDER/"$CHANGES"}
-          PAYLOAD=${PAYLOAD//NEW_PLACEHOLDER/"$NEWROWS"}
-          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+          payload=${payload//UPS_PLACEHOLDER/"$UPS"}
+          payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          payload=${payload//NOW_PLACEHOLDER/"$NOW"}
+          payload=${payload//CHANGES_PLACEHOLDER/"$CHANGES"}
+          payload=${payload//NEW_PLACEHOLDER/"$NEWROWS"}
+          curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
 
+      # Discord: failure
       - name: Notify Discord (failure)
-        if: steps.timegate.outputs.run == 'true' && failure() && env.DISCORD_WEBHOOK != ''
+        if: failure() && env.DISCORD_WEBHOOK != ''
         env:
           WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          PAYLOAD=$(cat <<'JSON'
+          payload=$(cat <<'JSON'
           {"username":"CFB Uploader","embeds":[{"title":"❌ data_uploader failed","description":"Branch: **${{ github.ref_name }}**\nSee run logs for details.","url":"RUN_URL_PLACEHOLDER","timestamp":"NOW_PLACEHOLDER","color":15158332}]}
           JSON
           )
-          PAYLOAD=${PAYLOAD//RUN_URL_PLACEHOLDER/"$RUN_URL"}
-          PAYLOAD=${PAYLOAD//NOW_PLACEHOLDER/"$NOW"}
-          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+          payload=${payload//RUN_URL_PLACEHOLDER/"$RUN_URL"}
+          payload=${payload//NOW_PLACEHOLDER/"$NOW"}
+          curl -sS -H "Content-Type: application/json" -d "$payload" "$WEBHOOK"
