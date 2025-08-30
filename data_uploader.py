@@ -650,17 +650,6 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 
 model_df = build_model_data(combined_df)
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import re
-import ssl
-import sys
-import pandas as pd
-from sqlalchemy import create_engine, inspect, text
-
-# ----------------------------- CONFIG ---------------------------------
 TABLE = "PreparedData"
 KEYS  = ["id", "team", "opponent"]
 
@@ -684,10 +673,14 @@ DEFAULT_NUM_COLS = [
     "consensus_spread","consensus_overunder","consensus_opening_spread","consensus_opening_overunder",
     "neutralSite","conferenceGame","homeId","awayId","id",
 ]
+
+# Columns to ignore for "real" diffs (e.g., schedule tweaks that shouldn't cause upserts)
 IGNORE_FOR_DIFF = {"startDate"}
 
-# ------------------------ HELPER FUNCTIONS ----------------------------
+# Optional default; can be overridden by env in the auto-run block
+INCLUDE_STARTDATE_CHANGES = False
 
+# ------------------------ HELPER FUNCTIONS ----------------------------
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     """Normalize a slice for stable equality/diff checks."""
     x = df_slice.copy()
@@ -700,6 +693,7 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     # DATES: to UTC -> epoch seconds (Int64)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
+        # convert to epoch seconds; Int64 keeps NA
         epoch = (dt.view("int64") // 1_000_000_000)
         x[c] = pd.Series(epoch, index=x.index).astype("Int64")
 
@@ -721,9 +715,7 @@ def _param_name(col: str) -> str:
     # safe param names for dotted columns
     return "p_" + re.sub(r"[^0-9a-zA-Z_]", "_", col)
 
-
 # ------------------------------ MAIN ----------------------------------
-
 def main(model_df: pd.DataFrame) -> None:
     # 1) Read DATABASE_URL from env (no hard-coding)
     DATABASE_URL = os.getenv("DATABASE_URL")
@@ -791,60 +783,89 @@ def main(model_df: pd.DataFrame) -> None:
     changed_rows = pd.DataFrame(columns=common_cols)
     diff_summary = {}
 
-    # 8) Changed rows via canonical comparison
+    # 8) Changed rows via canonical comparison (with diagnostics)
     if not db_trim.empty and not model_trim.empty:
         common_index = model_idx.index.intersection(db_idx.index)
         if len(common_index):
             nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
+
             modN = canon(model_idx.loc[common_index, nonkey_cols])
             dbN  = canon(db_idx.loc[common_index, nonkey_cols])
 
-            # cell-wise equality (after canon)
+            # ensure identical column order
+            modN = modN[nonkey_cols]
+            dbN  = dbN[nonkey_cols]
+
+            # cell-wise equality after canon
             eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
 
-            # count changes by column, excluding ignored columns
-            diff_summary = {
-                c: int((~eq[c]).sum())
-                for c in modN.columns
-                if c not in IGNORE_FOR_DIFF
-            }
+            # summaries
+            diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
 
-            # treat ignored columns as equal so startDate-only diffs don't flag a row
-            eq_ignore = eq.copy()
-            for c in (set(IGNORE_FOR_DIFF) & set(eq.columns)):
-                eq_ignore[c] = True
+            # masks
+            mask_any_change = (~eq).any(axis=1)
+
+            global INCLUDE_STARTDATE_CHANGES
+            if INCLUDE_STARTDATE_CHANGES:
+                mask_real_change = mask_any_change
+                mask_only_ignored = pd.Series(False, index=eq.index)
+            else:
+                kept_cols = [c for c in eq.columns if c not in IGNORE_FOR_DIFF]
+                mask_real_change = (~eq[kept_cols]).any(axis=1) if kept_cols else pd.Series(False, index=eq.index)
+                # changed but all changes live in ignored columns
+                if kept_cols:
+                    mask_only_ignored = mask_any_change & eq[kept_cols].all(axis=1)
+                else:
+                    mask_only_ignored = mask_any_change
 
             # rows changed in at least one NON-ignored column
-            changed_keys_idx = eq_ignore.all(axis=1).index[~eq_ignore.all(axis=1)]
+            changed_keys_idx = modN.index[mask_real_change]
             if len(changed_keys_idx):
                 changed_rows = model_idx.loc[changed_keys_idx, common_cols].copy()
+
+            # DEBUG: print quick diagnostics
+            n_any   = int(mask_any_change.sum())
+            n_onlyI = int(mask_only_ignored.sum())
+            n_real  = int(mask_real_change.sum())
+            print(f"Diff diagnostics: any_change={n_any}, only_ignored={n_onlyI}, real_changes={n_real}")
+
+            if diff_summary:
+                nz = {k: v for k, v in diff_summary.items() if v}
+                print("Changed cells by column (all, including ignored):", nz)
+                ign = {k: v for k, v in diff_summary.items() if k in IGNORE_FOR_DIFF and v}
+                if ign and not INCLUDE_STARTDATE_CHANGES:
+                    print("FYI: changes occurred ONLY in ignored columns (not upserting these):", ign)
+
+            # Example prints for ignored-only cases
+            if n_onlyI:
+                ex = list(modN.index[mask_only_ignored])[:5]
+                for idx in ex:
+                    ch_cols = [c for c in nonkey_cols if c in eq.columns and not eq.loc[idx, c]]
+                    gid, gteam, gopp = idx
+                    print("ONLY_IGNORED_CHANGE",
+                          f"id={gid} team={gteam} opponent={gopp} changed_cols={ch_cols}")
 
     print(f"NEW rows: {len(new_rows)}")
     print(f"CHANGED rows (after normalization): {len(changed_rows)}")
 
-    if diff_summary:
-        nz = {k: v for k, v in diff_summary.items() if v and k not in IGNORE_FOR_DIFF}
-        if nz:
-            print("Changed cells by column (non-zero only):", nz)
-
-    # 9) Discord-friendly per-row diffs (ignoring startDate-only)
+    # 9) Discord-friendly per-row diffs (ignoring startDate-only unless INCLUDE_STARTDATE_CHANGES)
     if not db_trim.empty and not model_trim.empty and 'eq' in locals():
         nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
         all_changed_idx = eq.all(axis=1).index[~eq.all(axis=1)]
         for idx in all_changed_idx:
-            ch_cols = [
-                c for c in nonkey_cols
-                if (c in eq.columns and not eq.loc[idx, c] and c not in IGNORE_FOR_DIFF)
-            ]
-            if not ch_cols:
+            ch_cols = [c for c in nonkey_cols if (c in eq.columns and not eq.loc[idx, c])]
+            if not INCLUDE_STARTDATE_CHANGES and set(ch_cols).issubset(IGNORE_FOR_DIFF):
                 continue  # only ignored columns changed
             parts = []
             for c in ch_cols:
+                if not INCLUDE_STARTDATE_CHANGES and c in IGNORE_FOR_DIFF:
+                    continue
                 old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
                 new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
                 parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")
-            gid, gteam, gopp = idx  # composite key (id, team, opponent)
-            print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
+            if parts:
+                gid, gteam, gopp = idx  # composite key (id, team, opponent)
+                print("DISCORD_DIFF", f"id={gid} team={gteam} opponent={gopp} | " + "; ".join(parts))
 
     # Print NEW rows (keys only)
     if not new_rows.empty:
@@ -892,12 +913,10 @@ def main(model_df: pd.DataFrame) -> None:
 
     # 11) Ensure PK exists on (id, team, opponent)
     with engine.begin() as conn:
-        # add NOT NULLs first (safe if already set)
         conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "id"       SET NOT NULL;'))
         conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "team"     SET NOT NULL;'))
         conn.execute(text('ALTER TABLE "PreparedData" ALTER COLUMN "opponent" SET NOT NULL;'))
 
-        # create PK if missing
         conn.execute(text('''
         DO $$
         BEGIN
@@ -916,3 +935,28 @@ def main(model_df: pd.DataFrame) -> None:
         '''))
 
     print("Sync complete.")
+
+# ------------------------------ RUN IMMEDIATELY ------------------------------
+print("[data_uploader] Starting DB sync...", flush=True)
+
+try:
+    # Let env override the default behavior for startDate-only changes
+    INCLUDE_STARTDATE_CHANGES = os.getenv("INCLUDE_STARTDATE_CHANGES", "0").lower() in {"1","true","yes","y"}
+
+    # If not already defined above, load or construct model_df here
+    if "model_df" not in globals():
+        # Replace this import with your real pipeline if needed,
+        # or remove if you already built model_df earlier in the file.
+        from your_pipeline_module import build_model_data  # <-- adjust or delete
+        if "combined_df" not in globals():
+            raise RuntimeError("combined_df is not defined. You must construct it before this script runs.")
+        model_df = build_model_data(combined_df)
+
+    main(model_df)
+
+except Exception as e:
+    print(f"[data_uploader] Sync failed: {e}", flush=True)
+    raise
+
+finally:
+    print("[data_uploader] Done.", flush=True)
