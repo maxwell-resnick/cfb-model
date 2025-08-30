@@ -414,16 +414,41 @@ get_pregame_latents <- function() {
   fit_passing <- qread("glmms/fit_passing.qs")
   fit_rushing <- qread("glmms/fit_rushing.qs")
   
-  # 2) Training frame through 2020 (for reference only if needed)
-  con <- dbConnect(
-    RPostgres::Postgres(),
-    dbname   = "neondb",
-    host     = "ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech",
-    port     = 5432,
-    user     = "neondb_owner",
-    password = Sys.getenv("NEON_PG_PASS", "npg_1d0oXImKqyJv"),
-    sslmode  = "require"
-  )
+  connect_neon <- function() {
+    library(DBI); library(RPostgres); library(httr)
+    
+    url <- Sys.getenv("DATABASE_URL", unset = "")
+    if (nzchar(url)) {
+      pu <- httr::parse_url(url)
+      host <- pu$hostname
+      port <- as.integer(pu$port %||% 5432L)
+      db   <- sub("^/", "", pu$path %||% "")
+      user <- utils::URLdecode(pu$username %||% "")
+      pass <- utils::URLdecode(pu$password %||% "")
+      ssl  <- pu$query$sslmode %||% "require"
+    } else {
+      host <- Sys.getenv("PGHOST")
+      port <- as.integer(Sys.getenv("PGPORT", "5432"))
+      db   <- Sys.getenv("PGDATABASE")
+      user <- Sys.getenv("PGUSER")
+      pass <- Sys.getenv("PGPASSWORD")
+      ssl  <- Sys.getenv("PGSSLMODE", "require")
+    }
+    
+    stopifnot(nzchar(host), nzchar(db), nzchar(user), nzchar(pass))
+    DBI::dbConnect(
+      RPostgres::Postgres(),
+      host     = host,
+      port     = port,
+      dbname   = db,
+      user     = user,
+      password = pass,
+      sslmode  = ssl
+    )
+  }
+  
+  con <- connect_neon()
+  
   model_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season <= 2020;')
   
   # 3) Pull future rows 2021–2025 (played + unplayed)

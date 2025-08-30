@@ -499,11 +499,6 @@ ppa_map_2025 <- merged_df %>%
   group_by(season, team) %>%
   summarise(percentPPA = dplyr::first(percentPPA[!is.na(percentPPA)]), .groups = "drop")
 
-# ------------------------------------------------------------------------------
-# 4) Team-centric per-book lines (same sign convention as training)
-# ------------------------------------------------------------------------------
-library(dplyr)
-
 merged_df <- merged_df %>%
   mutate(
     # ---- OddsAPI books (already team-perspective) ----
@@ -615,34 +610,14 @@ spread_scores_keys_2025 <- merged_df %>%
   ) %>%
   distinct(season, week, team, opponent, .keep_all = TRUE)
 
-# ------------------------------------------------------------------------------
-# 6) Join 2025 latents + rolling pass rate + adj features
-# ------------------------------------------------------------------------------
 pregame_latents <- get_pregame_latents()
-
-combined_2025 <- pregame_latents %>%
-  dplyr::filter(season == 2025) %>%
-  dplyr::left_join(spread_scores_keys_2025, by = c("season","week","team","opponent")) %>%
-  group_by(team) %>%
-  arrange(season, week, .by_group = TRUE) %>%
-  mutate(
-    rolling_passing_rate = slider::slide_dbl(
-      dplyr::lag(passing_rate), mean, na.rm = TRUE,
-      .before = 9, .complete = TRUE
-    )
-  ) %>%
-  ungroup() %>%
-  mutate(
-    adj_offense_effect_passing = rolling_passing_rate * offense_effect_passing,
-    adj_offense_effect_rushing = (1 - rolling_passing_rate) * offense_effect_rushing
-  )
 
 avg_row <- function(...) {
   x <- rowMeans(cbind(...), na.rm = TRUE)
   ifelse(is.nan(x), NA_real_, x)
 }
 
-combined_2025 <- combined_2025 %>%
+spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
   mutate(
     # OPENING lines: only from DB books (Bovada / ESPN Bet)
     formatted_opening_spread = avg_row(
@@ -680,12 +655,117 @@ combined_2025 <- combined_2025 %>%
     vegas_opening_team_points = (formatted_opening_overunder + formatted_opening_spread) / 2,
     vegas_team_points         = (formatted_overunder         + formatted_spread)         / 2
   )
-# ------------------------------------------------------------------------------
-# 8) Opponent swap features
-# ------------------------------------------------------------------------------
+
+con <- connect_neon()
+
+passing_rate_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season >= 2023;')
+
+avg3 <- function(a, b, c) {
+  n <- (!is.na(a)) + (!is.na(b)) + (!is.na(c))
+  (coalesce(a, 0) + coalesce(b, 0) + coalesce(c, 0)) / ifelse(n == 0, NA_real_, n)
+}
+
+passing_rate_df <- passing_rate_df %>%
+  mutate(
+    is_home = ifelse(homeTeam == team, 1, 0),
+    bovada_formatted_opening_spread = case_when(
+    is_home == 1L ~ -bovada_opening_spread,
+    is_home == 0L ~  bovada_opening_spread,
+    TRUE          ~ NA_real_
+    ),
+    espnbet_formatted_opening_spread = case_when(
+      is_home == 1L ~ -espnbet_opening_spread,
+      is_home == 0L ~  espnbet_opening_spread,
+      TRUE          ~ NA_real_
+    ),
+    draftkings_formatted_opening_spread = case_when(
+      is_home == 1L ~ -draftkings_opening_spread,
+      is_home == 0L ~  draftkings_opening_spread,
+      TRUE          ~ NA_real_
+    ),
+    formatted_opening_spread = avg3(
+      bovada_formatted_opening_spread, espnbet_formatted_opening_spread, draftkings_formatted_opening_spread
+    )
+  )
+
+passing_rate_df <- passing_rate_df %>%
+  mutate(
+    passing_plays = suppressWarnings(as.numeric(`offense_passingPlays.totalPPA`) /
+                                       as.numeric(`offense_passingPlays.ppa`)),
+    rushing_plays = suppressWarnings(as.numeric(`offense_rushingPlays.totalPPA`) /
+                                       as.numeric(`offense_rushingPlays.ppa`)),
+    total_plays   = suppressWarnings(as.numeric(passing_plays + rushing_plays)),
+    passing_rate  = passing_plays / (passing_plays + rushing_plays),
+    
+    startDate     = as.POSIXct(startDate, tz = "UTC"),
+    formatted_opening_spread = suppressWarnings(as.numeric(formatted_opening_spread)),
+    is_completed  = !is.na(homePoints) & !is.na(awayPoints)
+  )
+
+lm_pr <- lm(
+  passing_rate ~ formatted_opening_spread,
+  data = passing_rate_df %>% filter(is_completed, !is.na(passing_rate), !is.na(formatted_opening_spread))
+)
+lm_tp <- lm(
+  total_plays ~ formatted_opening_spread,
+  data = passing_rate_df %>% filter(is_completed, !is.na(total_plays), !is.na(formatted_opening_spread))
+)
+
+print(summary(lm_pr))
+print(summary(lm_tp))
+
+# 3) Vectorized predictions and residuals (completed games only)
+b_pr <- coef(lm_pr); b_tp <- coef(lm_tp)
+b0_pr <- unname(b_pr["(Intercept)"]);                  b1_pr <- unname(b_pr["formatted_opening_spread"])
+b0_tp <- unname(b_tp["(Intercept)"]);                  b1_tp <- unname(b_tp["formatted_opening_spread"])
+
+passing_rate_df <- passing_rate_df %>%
+  mutate(
+    pr_pred = b0_pr + b1_pr * formatted_opening_spread,
+    tp_pred = b0_tp + b1_tp * formatted_opening_spread,
+    pr_resid = if_else(is_completed & !is.na(passing_rate), passing_rate - pr_pred, NA_real_),
+    tp_resid = if_else(is_completed & !is.na(total_plays),  total_plays  - tp_pred, NA_real_)
+  )
+
+# 4) Per-team most-recent 12-game rolling residual means (exclude current via lag)
+rolling_passing_rate_summary <- passing_rate_df %>%
+  arrange(team, startDate) %>%
+  group_by(team) %>%
+  mutate(
+    rolling_passing_rate = slide_dbl(
+      lag(pr_resid),
+      .f = function(x) {
+        x <- x[!is.na(x)]
+        if (length(x) < 12) return(NA_real_)
+        mean(tail(x, 12))
+      },
+      .before = Inf, .complete = FALSE
+    ),
+    rolling_total_plays = slide_dbl(
+      lag(tp_resid),
+      .f = function(x) {
+        x <- x[!is.na(x)]
+        if (length(x) < 12) return(NA_real_)
+        mean(tail(x, 12))
+      },
+      .before = Inf, .complete = FALSE
+    )
+  ) %>%
+  slice_tail(n = 1) %>%                      # keep most recent row per team
+  ungroup() %>%
+  select(team, rolling_passing_rate, rolling_total_plays)
+
+combined_2025 <- pregame_latents %>%
+  dplyr::filter(season == 2025) %>%
+  dplyr::left_join(spread_scores_keys_2025, by = c("season","week","team","opponent")) %>%
+  # avoid duplicate column name clashes if these already exist
+  dplyr::select(-dplyr::any_of(c("rolling_passing_rate","rolling_total_plays"))) %>%
+  dplyr::left_join(rolling_passing_rate_summary, by = "team")
+
+
 swap_cols <- c("offense_effect_overall","offense_effect_passing","offense_effect_rushing",
                "defense_effect_overall","defense_effect_passing","defense_effect_rushing",
-               "rolling_passing_rate","adj_offense_effect_passing","adj_offense_effect_rushing")
+               "rolling_passing_rate", "rolling_total_plays")
 
 opp_feats_2025 <- combined_2025 %>%
   dplyr::select(id, team, opponent, season, week, dplyr::all_of(swap_cols)) %>%
@@ -698,40 +778,6 @@ combined_2025 <- combined_2025 %>%
     by = c("id","season","week","team" = "team_swapped","opponent" = "opponent_swapped")
   )
 
-# Existing step
-combined_2025 <- combined_2025 %>%
-  dplyr::left_join(
-    opp_feats_2025,
-    by = c("id","season","week","team" = "team_swapped","opponent" = "opponent_swapped")
-  )
-
-# --- Manual MGM imputes here, then flip for the opponent row of the same id ---
-
-# 1) Define the manual imputes you want (add rows as needed)
-manual_mgm_impute <- tibble::tibble(
-  season        = 2025L,
-  team          = c("Navy"),     # team perspective you want to set
-  opponent      = c("Army"),
-  mgm_spread_impute = c(-3),     # your imputed line for *this team* row
-  mgm_price_impute  = c(-110)    # price for this team row
-)
-
-# 2) Attach the manual values to matching rows (by season/team/opponent)
-combined_2025 <- combined_2025 %>%
-  dplyr::left_join(
-    manual_mgm_impute %>% dplyr::select(season, team, opponent, mgm_spread_impute, mgm_price_impute),
-    by = c("season","team","opponent")
-  ) %>%
-  dplyr::mutate(
-    # fill only if currently NA
-    mgm_formatted_spread       = dplyr::coalesce(mgm_formatted_spread,       as.numeric(mgm_spread_impute)),
-    mgm_formatted_spread_price = dplyr::coalesce(mgm_formatted_spread_price, as.numeric(mgm_price_impute))
-  ) %>%
-  dplyr::select(-mgm_spread_impute, -mgm_price_impute)
-
-# 3) Mirror to the other team row in the same game id:
-#    - spread flips sign
-#    - price is copied as-is (common case like -110/-110)
 combined_2025 <- combined_2025 %>%
   dplyr::group_by(id) %>%
   dplyr::mutate(

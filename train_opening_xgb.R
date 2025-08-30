@@ -1,14 +1,39 @@
 source("kalman_filter.R")
 
-con <- dbConnect(
-  RPostgres::Postgres(),
-  dbname   = "neondb",
-  host     = "ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech",
-  port     = 5432,
-  user     = "neondb_owner",
-  password = "npg_1d0oXImKqyJv",  # or Sys.getenv("NEON_PG_PASS")
-  sslmode  = "require"
-)
+connect_neon <- function() {
+  library(DBI); library(RPostgres); library(httr)
+  
+  url <- Sys.getenv("DATABASE_URL", unset = "")
+  if (nzchar(url)) {
+    pu <- httr::parse_url(url)
+    host <- pu$hostname
+    port <- as.integer(pu$port %||% 5432L)
+    db   <- sub("^/", "", pu$path %||% "")
+    user <- utils::URLdecode(pu$username %||% "")
+    pass <- utils::URLdecode(pu$password %||% "")
+    ssl  <- pu$query$sslmode %||% "require"
+  } else {
+    host <- Sys.getenv("PGHOST")
+    port <- as.integer(Sys.getenv("PGPORT", "5432"))
+    db   <- Sys.getenv("PGDATABASE")
+    user <- Sys.getenv("PGUSER")
+    pass <- Sys.getenv("PGPASSWORD")
+    ssl  <- Sys.getenv("PGSSLMODE", "require")
+  }
+  
+  stopifnot(nzchar(host), nzchar(db), nzchar(user), nzchar(pass))
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    host     = host,
+    port     = port,
+    dbname   = db,
+    user     = user,
+    password = pass,
+    sslmode  = ssl
+  )
+}
+
+con <- connect_neon()
 
 xgb_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season between 2020 and 2024;')
 
@@ -43,6 +68,7 @@ xgb_df <- xgb_df %>%
     
     passing_plays = offense_passingPlays.totalPPA / offense_passingPlays.ppa,
     rushing_plays = offense_rushingPlays.totalPPA / offense_rushingPlays.ppa,
+    total_plays = passing_plays + rushing_plays,
     passing_rate  = passing_plays / (passing_plays + rushing_plays),
     
     points_above_average          = offense_ppa * 65,
@@ -167,28 +193,13 @@ spread_scores_keys <- xgb_df %>%
     team_points, opponent_points, score_diff,
     team_talent_scaled, opponent_talent_scaled,
     team_percentPPA, opponent_percentPPA,
-    passing_rate, is_home
+    passing_rate, total_plays, is_home, startDate,
+    homePoints, awayPoints
   ) %>%
   distinct(season, week, team, opponent, .keep_all = TRUE)
 
 combined_df <- pregame_latents %>%
   left_join(spread_scores_keys, by = c("season","week","team","opponent"))
-
-combined_df <- combined_df %>%
-  group_by(team) %>%
-  arrange(season, week, .by_group = TRUE) %>%
-  mutate(
-    rolling_passing_rate = slider::slide_dbl(
-      dplyr::lag(passing_rate),  
-      mean, na.rm = TRUE,
-      .before = 9,              
-      .complete = TRUE        
-    )
-  ) %>%
-  ungroup() %>%
-  mutate(adj_offense_effect_passing = rolling_passing_rate * offense_effect_passing,
-         adj_offense_effect_rushing = (1 - rolling_passing_rate) * offense_effect_rushing)
-
 
 avg3 <- function(a, b, c) {
   n <- (!is.na(a)) + (!is.na(b)) + (!is.na(c))
@@ -220,6 +231,66 @@ combined_df <- combined_df %>%
       bovada_formatted_opening_overunder, espnbet_formatted_opening_overunder, draftkings_formatted_opening_overunder
     )
   )
+
+combined_df <- combined_df %>%
+  mutate(
+    startDate = as.POSIXct(startDate, tz = "UTC"),
+    total_plays = suppressWarnings(as.numeric(total_plays)),
+    formatted_opening_spread = suppressWarnings(as.numeric(formatted_opening_spread)),
+    is_completed = !is.na(homePoints) & !is.na(awayPoints)
+  )
+
+# 1) Fit simple LMs on COMPLETED games only
+lm_pr <- lm(
+  passing_rate ~ formatted_opening_spread,
+  data = combined_df %>%
+    filter(is_completed, !is.na(passing_rate), !is.na(formatted_opening_spread))
+)
+lm_tp <- lm(
+  total_plays ~ formatted_opening_spread,
+  data = combined_df %>%
+    filter(is_completed, !is.na(total_plays), !is.na(formatted_opening_spread))
+)
+
+print(summary(lm_pr))
+print(summary(lm_tp))
+
+# 2) Vectorized predictions to avoid predict() dropping rows
+b_pr <- coef(lm_pr); b_tp <- coef(lm_tp)
+b0_pr <- unname(b_pr["(Intercept)"]);                  b1_pr <- unname(b_pr["formatted_opening_spread"])
+b0_tp <- unname(b_tp["(Intercept)"]);                  b1_tp <- unname(b_tp["formatted_opening_spread"])
+
+combined_df <- combined_df %>%
+  mutate(
+    pr_pred = b0_pr + b1_pr * formatted_opening_spread,
+    tp_pred = b0_tp + b1_tp * formatted_opening_spread,
+    pr_resid = if_else(is_completed & !is.na(passing_rate), passing_rate - pr_pred, NA_real_),
+    tp_resid = if_else(is_completed & !is.na(total_plays),  total_plays  - tp_pred, NA_real_)
+  ) %>%
+  group_by(team) %>%
+  arrange(startDate, .by_group = TRUE) %>%
+  mutate(
+    # 12-game rolling residuals (past only, unweighted, require 12 completed prior games)
+    rolling_passing_rate = slide_dbl(
+      lag(pr_resid),
+      .f = function(x) {
+        x <- x[!is.na(x)]
+        if (length(x) < 12) return(NA_real_)
+        mean(tail(x, 12))
+      },
+      .before = 11, .complete = TRUE
+    ),
+    rolling_total_plays = slide_dbl(
+      lag(tp_resid),
+      .f = function(x) {
+        x <- x[!is.na(x)]
+        if (length(x) < 12) return(NA_real_)
+        mean(tail(x, 12))
+      },
+      .before = 11, .complete = TRUE
+    )
+  ) %>%
+  ungroup()
 
 model_df <- combined_df %>% filter(season >= 2021)
 
@@ -266,7 +337,7 @@ model_df <- model_df %>%
 
 swap_cols <- c("offense_effect_overall","offense_effect_passing","offense_effect_rushing",
                "defense_effect_overall","defense_effect_passing","defense_effect_rushing",
-               "rolling_passing_rate", "adj_offense_effect_passing","adj_offense_effect_rushing")
+               "rolling_passing_rate", "rolling_total_plays")
 
 opp_feats <- model_df %>%
   select(id, team, opponent, season, week, all_of(swap_cols)) %>%
@@ -280,12 +351,12 @@ model_df <- model_df %>%
   )
 
 features <- c(
-  "offense_effect_overall",#"offense_effect_passing","offense_effect_rushing",
+  "offense_effect_overall", "offense_effect_passing","offense_effect_rushing",
   "defense_effect_overall","defense_effect_passing","defense_effect_rushing",
-  "vegas_opening_team_points", "rolling_passing_rate",
-  "adj_offense_effect_passing", "adj_offense_effect_rushing",
-  "team_percentPPA", "opponent_percentPPA", "week",
-  "opponent_rolling_passing_rate", "opponent_offense_effect_overall", "opponent_defense_effect_overall"
+  "vegas_opening_team_points", "rolling_passing_rate", "opponent_rolling_passing_rate",
+  "rolling_total_plays",
+  "team_percentPPA", "opponent_percentPPA",
+  "opponent_offense_effect_overall", "opponent_defense_effect_overall"
 )
 
 cv_xgb <- model_df %>%
@@ -338,7 +409,7 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
       watchlist = list(train = dtr, val = dval),
       early_stopping_rounds = 20,
       maximize = FALSE,
-      verbose = 0
+      verbose = 1
     )
     
     best_it <- fit$best_iteration
@@ -371,7 +442,7 @@ set.seed(2025)
 
 opt <- bayesOpt(
   FUN = xgb_cv_score, bounds = bounds,
-  initPoints = 10, iters.n = 100,
+  initPoints = 10, iters.n = 20,
   acq = "ei", parallel = FALSE, verbose = 1
 )
 
@@ -387,7 +458,7 @@ params_final <- c(
 set.seed(2025)
 cv_best <- xgb.cv(
   params = params_final, data = dall, nrounds = 1000,
-  folds = folds, early_stopping_rounds = 100,
+  folds = folds, early_stopping_rounds = 20,
   maximize = FALSE, verbose = 0
 )
 best_iter <- cv_best$best_iteration
@@ -686,17 +757,6 @@ pm_bins <- oos_games %>%
   ) %>%
   arrange(pick_margin)
 
-ggplot(pm_bins, aes(x = pick_margin, y = hit_rate)) +
-  geom_hline(yintercept = 0.524, linetype = 2, linewidth = 0.3) +
-  geom_point(aes(size = n), alpha = 0.7) +
-  geom_smooth(
-    aes(weight = n), method = "lm", formula = y ~ x, se = FALSE, linewidth = 1
-  ) +
-  scale_y_continuous("Hit rate", labels = percent_format(accuracy = 1), limits = c(0.4, 0.6)) +
-  scale_x_continuous("Pick margin (points)") +
-  theme_minimal(base_size = 12)
-
-
 suppressPackageStartupMessages({
   library(dplyr)
   library(ggplot2)
@@ -745,6 +805,7 @@ ou_units_line
 # (optional) quick plots to sanity-check
 if (!is.null(spread_fit$lm)) {
   ggplot(spread_fit$bins, aes(x = x, y = y)) +
+    geom_hline(yintercept = 0.524, linetype = 2, linewidth = 0.3) +
     geom_point(aes(size = n), alpha = 0.7) +
     geom_abline(slope = spread_fit$m, intercept = spread_fit$b) +
     labs(x = "Pick margin (points)", y = "Hit rate", title = paste("Spread:", spread_units_line)) +
@@ -754,6 +815,7 @@ if (!is.null(spread_fit$lm)) {
 if (!is.null(ou_fit$lm)) {
   ggplot(ou_fit$bins, aes(x = x, y = y)) +
     geom_point(aes(size = n), alpha = 0.7) +
+    geom_hline(yintercept = 0.524, linetype = 2, linewidth = 0.3) +
     geom_abline(slope = ou_fit$m, intercept = ou_fit$b) +
     labs(x = "OU pick margin (points)", y = "OU hit rate", title = paste("OU:", ou_units_line)) +
     scale_y_continuous(limits = c(0,1)) + theme_minimal()
