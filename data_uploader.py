@@ -7,6 +7,7 @@ import cfbd
 from pandas import json_normalize
 import ssl
 from sqlalchemy import create_engine, text, inspect
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import os, certifi
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -650,11 +651,15 @@ def build_model_data(final_df: pd.DataFrame) -> pd.DataFrame:
 
 model_df = build_model_data(combined_df)
 
+try:
+    from dotenv import load_dotenv  # optional
+    load_dotenv()
+except Exception:
+    pass
+
+# ----------------------------- CONFIG ---------------------------------
 TABLE = "PreparedData"
 KEYS  = ["id", "team", "opponent"]
-
-# model_df must already be defined upstream
-# e.g., from data assembly code: model_df = build_model_data(combined_df)
 
 # Canonicalization rules (stable diffs)
 DEFAULT_TEXT_COLS = [
@@ -680,6 +685,22 @@ IGNORE_FOR_DIFF = {"startDate"}
 # Optional default; can be overridden by env in the auto-run block
 INCLUDE_STARTDATE_CHANGES = False
 
+# ------------------------ URL NORMALIZATION ---------------------------
+def normalize_db_url(url: str) -> str:
+    """
+    Force pg8000 driver and strip libpq-only params that pg8000 doesn't accept.
+    E.g., postgresql://...&sslmode=require&channel_binding=require  -> postgresql+pg8000://... (no sslmode/channel_binding)
+    """
+    # force pg8000 scheme
+    if url.startswith("postgresql://") and "+pg8000" not in url:
+        url = url.replace("postgresql://", "postgresql+pg8000://", 1)
+    p = urlparse(url)
+    qs = dict(parse_qsl(p.query, keep_blank_values=True))
+    qs.pop("sslmode", None)
+    qs.pop("channel_binding", None)
+    # reassemble
+    return urlunparse(p._replace(query=urlencode(qs)))
+
 # ------------------------ HELPER FUNCTIONS ----------------------------
 def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     """Normalize a slice for stable equality/diff checks."""
@@ -693,7 +714,6 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     # DATES: to UTC -> epoch seconds (Int64)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
-        # convert to epoch seconds; Int64 keeps NA
         epoch = (dt.view("int64") // 1_000_000_000)
         x[c] = pd.Series(epoch, index=x.index).astype("Int64")
 
@@ -723,6 +743,9 @@ def main(model_df: pd.DataFrame) -> None:
         raise RuntimeError(
             "DATABASE_URL env var is not set. Configure it in your environment/CI secrets."
         )
+
+    # 1a) Normalize URL for pg8000 and remove unsupported params
+    DATABASE_URL = normalize_db_url(DATABASE_URL)
 
     # 2) Create engine (Neon requires SSL)
     engine = create_engine(
@@ -943,14 +966,11 @@ try:
     # Let env override the default behavior for startDate-only changes
     INCLUDE_STARTDATE_CHANGES = os.getenv("INCLUDE_STARTDATE_CHANGES", "0").lower() in {"1","true","yes","y"}
 
-    # If not already defined above, load or construct model_df here
+    # Expect model_df to be defined upstream in your run (you already print combined_df above).
     if "model_df" not in globals():
-        # Replace this import with your real pipeline if needed,
-        # or remove if you already built model_df earlier in the file.
-        from your_pipeline_module import build_model_data  # <-- adjust or delete
-        if "combined_df" not in globals():
-            raise RuntimeError("combined_df is not defined. You must construct it before this script runs.")
-        model_df = build_model_data(combined_df)
+        raise RuntimeError(
+            "model_df is not defined. Build it upstream (e.g., model_df = build_model_data(combined_df)) before this script runs."
+        )
 
     main(model_df)
 
