@@ -223,9 +223,6 @@ if (!exists("numFactor", mode = "function")) {
   numFactor <- function(x) as.integer(as.factor(x))
 }
 
-# Load kalman pipeline (must define get_pregame_latents())
-source("./kalman_filter.R")
-
 # Robust loader for your saved XGB bundle
 load_model_bundle <- function(path) {
   b <- qs::qread(path)
@@ -610,6 +607,7 @@ spread_scores_keys_2025 <- merged_df %>%
   ) %>%
   distinct(season, week, team, opponent, .keep_all = TRUE)
 
+source("./kalman_filter.R")
 pregame_latents <- get_pregame_latents()
 
 avg_row <- function(...) {
@@ -652,8 +650,8 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
     ),
     
     # Implied team totals (same formulas you had)
-    vegas_opening_team_points = (formatted_opening_overunder - formatted_opening_spread) / 2,
-    vegas_team_points         = (formatted_overunder         - formatted_spread)         / 2
+    vegas_opening_team_points = (formatted_opening_overunder + formatted_opening_spread) / 2,
+    vegas_team_points         = (formatted_overunder         + formatted_spread)         / 2
   )
 
 con <- connect_neon()
@@ -807,141 +805,96 @@ features_used <- mdl_bundle$features
 missing_feats <- setdiff(features_used, names(combined_2025))
 if (length(missing_feats)) combined_2025[missing_feats] <- NA_real_
 
+# ---- Predictions for team points (already have final_xgb_fit, features_used, combined_2025) ----
 pred_2025 <- combined_2025 %>%
-  dplyr::mutate(across(all_of(features_used), as.numeric))
+  mutate(across(all_of(features_used), as.numeric))
 
 X_2025 <- as.matrix(pred_2025[, features_used, drop = FALSE])
 d2025  <- xgboost::xgb.DMatrix(X_2025, missing = NA)
 pred_2025$pred_team_points <- predict(final_xgb_fit, d2025)
 
-# ------------------------------------------------------------------------------
-# 10) Opponent predictions, spreads, and most-favorable OPENING spread line
-# ------------------------------------------------------------------------------
+# Opponent predictions + team-perspective margin (FIXED SIGN)
 opp_preds_2025 <- pred_2025 %>%
-  dplyr::select(id, team, pred_team_points) %>%
-  dplyr::rename(opponent = team, pred_opponent_points = pred_team_points)
+  select(id, team, pred_team_points) %>%
+  rename(opponent = team, pred_opponent_points = pred_team_points)
 
 pred_2025 <- pred_2025 %>%
-  dplyr::left_join(opp_preds_2025, by = c("id", "opponent")) %>%
-  dplyr::mutate(pred_spread = pred_opponent_points - pred_team_points)
+  left_join(opp_preds_2025, by = c("id", "opponent")) %>%
+  mutate(
+    pred_margin = pred_team_points - pred_opponent_points,  # team - opp (team-perspective)
+    pred_total  = pred_team_points + pred_opponent_points,
+    actual_total = if_else(!is.na(team_points) & !is.na(opponent_points),
+                           team_points + opponent_points, NA_real_)
+  )
 
-pred_2025 <- pred_2025 %>%
-  dplyr::mutate(
-    n_lines = rowSums(!is.na(cbind(
-      dk_formatted_spread,
-      fd_formatted_spread,
-      mgm_formatted_spread
-    ))),
-    
-    edge_dk  = pred_spread - dk_formatted_spread,
-    edge_fd  = pred_spread - fd_formatted_spread,
-    edge_mgm = pred_spread - mgm_formatted_spread,
-    
-    # allow max.col to work even with some NAs
-    edge_dk  = ifelse(is.na(edge_dk),  -Inf, edge_dk),
-    edge_fd  = ifelse(is.na(edge_fd),  -Inf, edge_fd),
-    edge_mgm = ifelse(is.na(edge_mgm), -Inf, edge_mgm),
-    
-    best_idx = dplyr::if_else(
-      n_lines == 0, NA_integer_,
-      max.col(cbind(edge_dk, edge_fd, edge_mgm), ties.method = "first")
-    ),
-    
-    best_book = dplyr::case_when(
-      is.na(best_idx) ~ NA_character_,
-      best_idx == 1L  ~ "draftkings",
-      best_idx == 2L  ~ "fanduel",
-      best_idx == 3L  ~ "betmgm",
-      TRUE            ~ NA_character_
-    ),
-    
-    best_line = dplyr::case_when(
-      best_idx == 1L ~ dk_formatted_spread,
-      best_idx == 2L ~ fd_formatted_spread,
-      best_idx == 3L ~ mgm_formatted_spread,
-      TRUE ~ NA_real_
-    )
-    
-    , best_price = dplyr::case_when(
-        best_idx == 1L ~ dk_formatted_spread_price,
-        best_idx == 2L ~ fd_formatted_spread_price,
-        best_idx == 3L ~ mgm_formatted_spread_price,
-        TRUE ~ NA_real_
-      )
-  ) %>%
-  dplyr::select(-edge_dk, -edge_fd, -edge_mgm, -best_idx)
-
-
-# ensure eps exists
-if (!exists("eps", inherits = TRUE)) eps <- 1e-3
-
-# ------------------------------------------------------------------------------
-# 10) Spread picks (current lines: DK / FD / MGM)
-# ------------------------------------------------------------------------------
-
-library(dplyr)
-library(stringr)
-
-# Ensure optional ESPN Bet columns exist (so selects & cbind won't error)
-for (nm in c(
-  "espnbet_formatted_spread", "espnbet_formatted_spread_price",
-  "espnbet_formatted_overunder",
-  "espnbet_formatted_total_over_price", "espnbet_formatted_total_under_price"
-)) {
-  if (!nm %in% names(pred_2025)) pred_2025[[nm]] <- NA_real_
+# Ensure optional columns exist (so matrices below never fail)
+ensure_cols <- function(df, cols, default = NA_real_) {
+  for (nm in cols) if (!nm %in% names(df)) df[[nm]] <- default
+  df
 }
 
+pred_2025 <- ensure_cols(
+  pred_2025,
+  c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread",
+    "dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price","espnbet_formatted_spread_price",
+    "dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder",
+    "dk_formatted_total_over_price","fd_formatted_total_over_price","mgm_formatted_total_over_price","espnbet_formatted_total_over_price",
+    "dk_formatted_total_under_price","fd_formatted_total_under_price","mgm_formatted_total_under_price","espnbet_formatted_total_under_price")
+)
+
+# Small epsilon for push checks
+if (!exists("eps", inherits = TRUE)) eps <- 1e-3
+
 # -----------------------------
-# 10) Spread picks (current lines with price-aware tie-break; DK/FD/MGM/ESPN)
+# Vectorized SPREAD pick (DK / FD / MGM / ESPN)
 # -----------------------------
+book_names  <- c("draftkings","fanduel","betmgm","espnbet")
+
+L_spread <- as.matrix(pred_2025[, c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread")])
+P_spread <- as.matrix(pred_2025[, c("dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price","espnbet_formatted_spread_price")])
+
+n <- nrow(pred_2025)
+if (is.null(dim(L_spread))) L_spread <- matrix(L_spread, nrow = n)   # guard for 1-row edge case
+if (is.null(dim(P_spread))) P_spread <- matrix(P_spread, nrow = n)
+
+PM <- matrix(pred_2025$pred_margin, nrow = n, ncol = ncol(L_spread))
+E_spread <- PM - L_spread                                      # edge = predicted team margin - line
+E_spread[is.na(E_spread)] <- -Inf
+
+# best edge per row
+Emax <- apply(E_spread, 1, max)
+has_line <- is.finite(Emax)
+
+# tie-break by price: only among cols achieving Emax (within tol)
+tol <- 1e-12
+mask_best <- sweep(E_spread, 1, Emax - tol, FUN = ">=") & is.finite(E_spread)
+P_masked  <- ifelse(mask_best, P_spread, NA_real_)
+
+# idx by price if any, else by edge
+idx_edge  <- ifelse(has_line, max.col(replace(E_spread, !is.finite(E_spread), -Inf), ties.method = "first"), NA_integer_)
+has_price <- rowSums(!is.na(P_masked)) > 0
+idx_price <- ifelse(has_price, max.col(replace(P_masked, is.na(P_masked), -Inf), ties.method = "first"), NA_integer_)
+idx_best  <- ifelse(is.na(idx_price), idx_edge, idx_price)  # prefer price tie-break when available
+
+best_line_spread <- rep(NA_real_, n)
+best_edge_spread <- rep(NA_real_, n)
+best_book_spread <- rep(NA_character_, n)
+
+ok <- !is.na(idx_best)
+if (any(ok)) {
+  rr <- which(ok)
+  cc <- idx_best[ok]
+  best_line_spread[ok] <- L_spread[cbind(rr, cc)]
+  best_edge_spread[ok] <- E_spread[cbind(rr, cc)]
+  best_book_spread[ok] <- book_names[cc]
+}
+
 pred_2025 <- pred_2025 %>%
   mutate(
-    # how many usable spread lines
-    n_lines = rowSums(!is.na(cbind(
-      dk_formatted_spread,
-      fd_formatted_spread,
-      mgm_formatted_spread,
-      espnbet_formatted_spread
-    )))
-  ) %>%
-  rowwise() %>%
-  mutate(
-    # choose best spread book by largest edge; break ties by better (numerically larger) price
-    best_book = {
-      if (n_lines == 0) NA_character_ else {
-        lines  <- c(dk_formatted_spread, fd_formatted_spread, mgm_formatted_spread, espnbet_formatted_spread)
-        prices <- c(dk_formatted_spread_price, fd_formatted_spread_price, mgm_formatted_spread_price, espnbet_formatted_spread_price)
-        books  <- c("draftkings", "fanduel", "betmgm", "espnbet")
-        edges  <- pred_spread - lines
-        edges[is.na(edges)] <- -Inf
-        be   <- max(edges)
-        cand <- which(edges >= be - 1e-9)
-        if (length(cand) > 1) {
-          pr <- prices[cand]
-          if (all(is.na(pr))) books[cand[1]] else books[cand[which.max(pr)]]
-        } else books[cand[1]]
-      }
-    },
-    best_line = {
-      if (n_lines == 0) NA_real_ else {
-        lines  <- c(dk_formatted_spread, fd_formatted_spread, mgm_formatted_spread, espnbet_formatted_spread)
-        prices <- c(dk_formatted_spread_price, fd_formatted_spread_price, mgm_formatted_spread_price, espnbet_formatted_spread_price)
-        edges  <- pred_spread - lines
-        edges[is.na(edges)] <- -Inf
-        be   <- max(edges)
-        cand <- which(edges >= be - 1e-9)
-        if (length(cand) > 1) {
-          pr <- prices[cand]
-          if (all(is.na(pr))) lines[cand[1]] else lines[cand[which.max(pr)]]
-        } else lines[cand[1]]
-      }
-    }
-  ) %>%
-  ungroup() %>%
-  mutate(
-    # cover/pick margins and push logic vs chosen spread
-    cover_margin   = ifelse(!is.na(score_diff) & !is.na(best_line), score_diff - best_line, NA_real_),
-    pick_margin    = ifelse(!is.na(best_line), pred_spread - best_line, NA_real_),
+    best_book  = best_book_spread,
+    best_line  = best_line_spread,
+    pick_margin = best_edge_spread,                       # = pred_margin - best_line
+    cover_margin = ifelse(!is.na(score_diff) & !is.na(best_line), score_diff - best_line, NA_real_),
     is_push_actual = ifelse(!is.na(cover_margin), abs(cover_margin) <= eps, NA),
     is_push_pick   = ifelse(!is.na(pick_margin),  abs(pick_margin)  <= eps, NA),
     Hit = case_when(
@@ -951,24 +904,17 @@ pred_2025 <- pred_2025 %>%
     )
   )
 
+# Choose the single spread pick per game (the team with the bigger modeled edge)
 picks_2025 <- pred_2025 %>%
   select(
     id, startDate, season, week, team, opponent,
     team_points, opponent_points, score_diff,
-    pred_team_points, pred_opponent_points, pred_spread,
+    pred_team_points, pred_opponent_points, pred_margin,
     best_book, best_line, pick_margin, cover_margin, Hit,
-    
-    # ----- per-book SPREAD (team-perspective) -----
     dk_formatted_spread,  dk_formatted_spread_price,
     fd_formatted_spread,  fd_formatted_spread_price,
     mgm_formatted_spread, mgm_formatted_spread_price,
-    espnbet_formatted_spread, espnbet_formatted_spread_price,
-    
-    # ----- per-book TOTAL (same number for both teams; include O/U prices) -----
-    dk_formatted_overunder,  dk_formatted_total_over_price,  dk_formatted_total_under_price,
-    fd_formatted_overunder,  fd_formatted_total_over_price,  fd_formatted_total_under_price,
-    mgm_formatted_overunder, mgm_formatted_total_over_price, mgm_formatted_total_under_price,
-    espnbet_formatted_overunder, espnbet_formatted_total_over_price, espnbet_formatted_total_under_price
+    espnbet_formatted_spread, espnbet_formatted_spread_price
   ) %>%
   group_by(id) %>%
   slice_max(order_by = pick_margin, n = 1, with_ties = FALSE) %>%
@@ -976,98 +922,70 @@ picks_2025 <- pred_2025 %>%
 
 stopifnot(anyDuplicated(picks_2025$id) == 0)
 
-# helper: safe max that returns NA (no warning) if everything is NA
-safe_max_vec <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) == 0) NA_real_ else max(x)
+# -----------------------------
+# Vectorized TOTAL pick (DK / FD / MGM / ESPN)
+# -----------------------------
+L_total <- as.matrix(pred_2025[, c("dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder")])
+PO      <- as.matrix(pred_2025[, c("dk_formatted_total_over_price","fd_formatted_total_over_price",
+                                   "mgm_formatted_total_over_price","espnbet_formatted_total_over_price")])
+PU      <- as.matrix(pred_2025[, c("dk_formatted_total_under_price","fd_formatted_total_under_price",
+                                   "mgm_formatted_total_under_price","espnbet_formatted_total_under_price")])
+
+if (is.null(dim(L_total))) L_total <- matrix(L_total, nrow = n)
+if (is.null(dim(PO)))      PO      <- matrix(PO, nrow = n)
+if (is.null(dim(PU)))      PU      <- matrix(PU, nrow = n)
+
+PT <- matrix(pred_2025$pred_total, nrow = n, ncol = ncol(L_total))
+E_over  <- PT - L_total                     # edge if betting OVER
+E_under <- L_total - PT                     # edge if betting UNDER
+E_over[is.na(E_over)]   <- -Inf
+E_under[is.na(E_under)] <- -Inf
+
+Eo_max <- apply(E_over,  1, max)
+Eu_max <- apply(E_under, 1, max)
+pick_over <- Eo_max >= Eu_max               # choose direction by larger edge
+
+# function to choose best book with price tiebreak for a given edge matrix & price matrix
+pick_idx_with_price <- function(E, P) {
+  Emax <- apply(E, 1, max)
+  has_line <- is.finite(Emax)
+  mask_best <- sweep(E, 1, Emax - tol, FUN = ">=") & is.finite(E)
+  Pm <- ifelse(mask_best, P, NA_real_)
+  idx_edge  <- ifelse(has_line, max.col(replace(E, !is.finite(E), -Inf), ties.method = "first"), NA_integer_)
+  has_price <- rowSums(!is.na(Pm)) > 0
+  idx_price <- ifelse(has_price, max.col(replace(Pm, is.na(Pm), -Inf), ties.method = "first"), NA_integer_)
+  ifelse(is.na(idx_price), idx_edge, idx_price)
 }
 
-# -----------------------------
-# 11) OVER/UNDER predictions (current totals: DK / FD / MGM / ESPN) — no warnings
-# -----------------------------
+idx_over  <- pick_idx_with_price(E_over,  PO)
+idx_under <- pick_idx_with_price(E_under, PU)
+idx_tot   <- ifelse(pick_over, idx_over, idx_under)
+
+best_ou_book <- rep(NA_character_, n)
+best_ou_line <- rep(NA_real_, n)
+ou_pick      <- ifelse(pick_over, "over", "under")
+# rows where we actually have a total line
+has_any_total <- rowSums(is.finite(E_over) | is.finite(E_under)) > 0 & !is.na(idx_tot)
+
+if (any(has_any_total)) {
+  rr <- which(has_any_total)
+  cc <- idx_tot[has_any_total]
+  best_ou_book[has_any_total] <- book_names[cc]
+  best_ou_line[has_any_total] <- L_total[cbind(rr, cc)]
+}
+
+# OU margins + hit
 pred_2025 <- pred_2025 %>%
-  dplyr::mutate(
-    pred_total   = pred_team_points + pred_opponent_points,
-    actual_total = dplyr::if_else(!is.na(team_points) & !is.na(opponent_points),
-                                  team_points + opponent_points, NA_real_),
-    n_ou_lines = rowSums(!is.na(cbind(
-      dk_formatted_overunder,
-      fd_formatted_overunder,
-      mgm_formatted_overunder,
-      espnbet_formatted_overunder
-    )))
-  ) %>%
-  dplyr::rowwise() %>%
-  dplyr::mutate(
-    # pick direction by comparing best available edges, safely
-    best_over_edge  = if (n_ou_lines == 0 || is.na(pred_total)) NA_real_ else safe_max_vec(c(
-      pred_total - dk_formatted_overunder,
-      pred_total - fd_formatted_overunder,
-      pred_total - mgm_formatted_overunder,
-      pred_total - espnbet_formatted_overunder
-    )),
-    best_under_edge = if (n_ou_lines == 0 || is.na(pred_total)) NA_real_ else safe_max_vec(c(
-      dk_formatted_overunder - pred_total,
-      fd_formatted_overunder - pred_total,
-      mgm_formatted_overunder - pred_total,
-      espnbet_formatted_overunder - pred_total
-    )),
-    ou_pick = dplyr::case_when(
-      n_ou_lines == 0 ~ NA_character_,
-      is.na(best_over_edge) & is.na(best_under_edge) ~ NA_character_,
-      best_over_edge >= best_under_edge ~ "over",
-      TRUE ~ "under"
-    ),
-    
-    # choose book with price tiebreak for chosen direction
-    best_ou_book = {
-      if (n_ou_lines == 0 || is.na(ou_pick)) NA_character_ else {
-        totals <- c(dk_formatted_overunder, fd_formatted_overunder, mgm_formatted_overunder, espnbet_formatted_overunder)
-        books  <- c("draftkings","fanduel","betmgm","espnbet")
-        if (ou_pick == "over") {
-          edges  <- pred_total - totals
-          prices <- c(dk_formatted_total_over_price, fd_formatted_total_over_price, mgm_formatted_total_over_price, espnbet_formatted_total_over_price)
-        } else {
-          edges  <- totals - pred_total
-          prices <- c(dk_formatted_total_under_price, fd_formatted_total_under_price, mgm_formatted_total_under_price, espnbet_formatted_total_under_price)
-        }
-        edges[is.na(edges)] <- -Inf
-        be   <- max(edges)
-        cand <- which(edges >= be - 1e-9)
-        if (length(cand) > 1) {
-          pr <- prices[cand]
-          if (all(is.na(pr))) books[cand[1]] else books[cand[which.max(pr)]]
-        } else books[cand[1]]
-      }
-    },
-    best_ou_line = {
-      if (n_ou_lines == 0 || is.na(ou_pick)) NA_real_ else {
-        totals <- c(dk_formatted_overunder, fd_formatted_overunder, mgm_formatted_overunder, espnbet_formatted_overunder)
-        if (ou_pick == "over") {
-          edges  <- pred_total - totals
-          prices <- c(dk_formatted_total_over_price, fd_formatted_total_over_price, mgm_formatted_total_over_price, espnbet_formatted_total_over_price)
-        } else {
-          edges  <- totals - pred_total
-          prices <- c(dk_formatted_total_under_price, fd_formatted_total_under_price, mgm_formatted_total_under_price, espnbet_formatted_total_under_price)
-        }
-        edges[is.na(edges)] <- -Inf
-        be   <- max(edges)
-        cand <- which(edges >= be - 1e-9)
-        if (length(cand) > 1) {
-          pr <- prices[cand]
-          if (all(is.na(pr))) totals[cand[1]] else totals[cand[which.max(pr)]]
-        } else totals[cand[1]]
-      }
-    }
-  ) %>%
-  dplyr::ungroup() %>%
-  dplyr::mutate(
-    ou_pick_margin = dplyr::case_when(
-      ou_pick == "over"  ~ pred_total   - best_ou_line,
+  mutate(
+    best_ou_book = best_ou_book,
+    best_ou_line = best_ou_line,
+    ou_pick      = ifelse(!has_any_total, NA, ou_pick),
+    ou_pick_margin = case_when(
+      ou_pick == "over"  ~ pred_total - best_ou_line,
       ou_pick == "under" ~ best_ou_line - pred_total,
       TRUE ~ NA_real_
     ),
-    ou_cover_margin = dplyr::case_when(
+    ou_cover_margin = case_when(
       ou_pick == "over"  ~ actual_total - best_ou_line,
       ou_pick == "under" ~ best_ou_line - actual_total,
       TRUE ~ NA_real_
@@ -1093,136 +1011,117 @@ picks_totals_2025 <- pred_2025 %>%
 
 stopifnot(anyDuplicated(picks_totals_2025$id) == 0)
 
-picks_2025 <- picks_2025 %>%
-  mutate(
-    spread_pick = ifelse(
-      is.na(team) | is.na(best_line),
-      NA_character_,
-      paste0(team, " ", fmt_line(best_line))
-    )
-  ) %>%
-  # bring in OU decision text
-  left_join(
-    picks_totals_2025 %>% select(id, ou_pick, best_ou_line),
-    by = "id"
-  ) %>%
-  mutate(
-    ou_pick_str = ifelse(
-      is.na(ou_pick) | is.na(best_ou_line),
-      NA_character_,
-      paste0(str_to_title(ou_pick), " ", format(round(best_ou_line, 1), nsmall = 1))
-    )
+# ---------- helpers (idempotent) ----------
+if (!exists("fmt_line", mode = "function")) {
+  fmt_line <- function(x) ifelse(
+    is.na(x), NA_character_,
+    ifelse(x > 0, paste0("+", format(round(x, 1), nsmall = 1)),
+           format(round(x, 1), nsmall = 1))
   )
+}
+if (!exists("calc_units", mode = "function")) {
+  calc_units <- function(p) {
+    ifelse(
+      is.na(p),
+      NA_integer_,
+      {
+        # 0 if < 52.5%
+        # 1 for [0.53,0.55), 2 for [0.55,0.57), 3 for [0.57,0.59),
+        # 4 for [0.59,0.61), 5 for >= 0.61
+        n <- floor((p - 0.53) / 0.02) + 1L
+        ifelse(p < 0.525, 0L, pmin(5L, pmax(0L, n)))
+      }
+    )
+  }
+}
+if (!exists("load_units_line", mode = "function")) {
+  load_units_line <- function(path) {
+    obj <- qs::qread(path)
+    if (is.list(obj) && all(c("m","b") %in% names(obj))) {
+      return(list(m = as.numeric(obj$m), b = as.numeric(obj$b)))
+    }
+    if (is.numeric(obj) && length(obj) >= 2) {
+      return(list(m = as.numeric(obj[1]), b = as.numeric(obj[2])))
+    }
+    if (is.character(obj) && length(obj) == 1) {
+      m <- suppressWarnings(as.numeric(stringr::str_match(obj, "y\\s*=\\s*([+-]?[0-9\\.eE]+)\\s*\\*\\s*x")[,2]))
+      b <- suppressWarnings(as.numeric(stringr::str_match(obj, "\\+\\s*([+-]?[0-9\\.eE]+)\\s*$")[,2]))
+      if (!is.na(m) && !is.na(b)) return(list(m = m, b = b))
+    }
+    stop(sprintf("Could not parse units line from %s", path))
+  }
+}
 
-final_2025 <- picks_2025 %>%
+# Load calibration coefs if not already present
+if (!exists("spread_coefs", inherits = TRUE)) spread_coefs <- load_units_line("spread_units_line.qs")
+if (!exists("ou_coefs",     inherits = TRUE)) ou_coefs     <- load_units_line("ou_units_line.qs")
+
+# ---------- bring per-book TOTALS columns from pred_2025 ----------
+ou_cols <- c(
+  "dk_formatted_overunder","fd_formatted_overunder",
+  "mgm_formatted_overunder","espnbet_formatted_overunder",
+  "dk_formatted_total_over_price","fd_formatted_total_over_price",
+  "mgm_formatted_total_over_price","espnbet_formatted_total_over_price",
+  "dk_formatted_total_under_price","fd_formatted_total_under_price",
+  "mgm_formatted_total_under_price","espnbet_formatted_total_under_price"
+)
+for (nm in setdiff(ou_cols, names(pred_2025))) pred_2025[[nm]] <- NA_real_
+
+# ---------- build final_2025_out with probabilities & units ----------
+final_2025_out <- picks_2025 %>%
+  # add totals market lines/prices for the chosen team row
+  dplyr::left_join(
+    pred_2025 %>% dplyr::select(id, team, dplyr::all_of(ou_cols)),
+    by = c("id","team")
+  ) %>%
+  # join OU pick summary (already resolved to one row per id)
   dplyr::left_join(
     picks_totals_2025 %>%
       dplyr::select(
-        id,
-        best_ou_book, best_ou_line, ou_pick,  # keep ou_pick; we’ll coalesce
+        id, best_ou_book, best_ou_line, ou_pick,
         ou_pick_margin, ou_cover_margin, ou_Hit,
         pred_total, actual_total
       ),
-    by = "id",
-    suffix = c("", ".tot")
+    by = "id"
   ) %>%
-  # prefer the value already in picks_2025, else take the one from picks_totals_2025
-  dplyr::mutate(
-    ou_pick      = dplyr::coalesce(ou_pick, ou_pick.tot),
-    best_ou_line = dplyr::coalesce(best_ou_line, best_ou_line.tot)
-  ) %>%
-  dplyr::select(-dplyr::ends_with(".tot")) %>%
   # pretty strings
   dplyr::mutate(
     spread_pick = dplyr::if_else(
       is.na(team) | is.na(best_line), NA_character_,
-      paste0(team, " ", ifelse(best_line > 0, paste0("+", format(round(best_line, 1), nsmall = 1)),
-                               format(round(best_line, 1), nsmall = 1)))
+      paste0(team, " ", fmt_line(best_line))
     ),
     ou_pick_str = dplyr::if_else(
       is.na(ou_pick) | is.na(best_ou_line), NA_character_,
       paste0(stringr::str_to_title(ou_pick), " ", format(round(best_ou_line, 1), nsmall = 1))
     )
   ) %>%
+  # probabilities from calibration lines
+  dplyr::mutate(
+    spread_hit_probability = pmin(
+      pmax(spread_coefs$m * as.numeric(pick_margin) + spread_coefs$b, 0), 1
+    ),
+    ou_hit_probability = pmin(
+      pmax(ou_coefs$m * as.numeric(ou_pick_margin) + ou_coefs$b, 0), 1
+    ),
+    spread_unit = calc_units(spread_hit_probability),
+    ou_unit     = calc_units(ou_hit_probability)
+  ) %>%
   dplyr::select(
     id, startDate, season, week, team, opponent,
-    pred_team_points, pred_opponent_points, pred_spread,
+    pred_team_points, pred_opponent_points, pred_margin,
     best_book, best_line, pick_margin, cover_margin, Hit, spread_pick,
     pred_total, actual_total, best_ou_book, best_ou_line,
     ou_pick, ou_pick_margin, ou_cover_margin, ou_Hit, ou_pick_str,
+    spread_hit_probability, ou_hit_probability, spread_unit, ou_unit,
+    # spreads per-book
     dk_formatted_spread,      dk_formatted_spread_price,
     fd_formatted_spread,      fd_formatted_spread_price,
     mgm_formatted_spread,     mgm_formatted_spread_price,
     espnbet_formatted_spread, espnbet_formatted_spread_price,
-    dk_formatted_overunder,      dk_formatted_total_over_price,      dk_formatted_total_under_price,
-    fd_formatted_overunder,      fd_formatted_total_over_price,      fd_formatted_total_under_price,
-    mgm_formatted_overunder,     mgm_formatted_total_over_price,     mgm_formatted_total_under_price,
-    espnbet_formatted_overunder, espnbet_formatted_total_over_price, espnbet_formatted_total_under_price
+    # totals per-book
+    dplyr::all_of(ou_cols)
   ) %>%
   dplyr::arrange(season, week, team)
-
-load_units_line <- function(path) {
-  obj <- qs::qread(path)
-  # if saved as list with m/b (from the optional meta save)
-  if (is.list(obj) && all(c("m","b") %in% names(obj))) {
-    return(list(m = as.numeric(obj$m), b = as.numeric(obj$b)))
-  }
-  # if saved as plain numeric vector c(m, b)
-  if (is.numeric(obj) && length(obj) >= 2) {
-    return(list(m = as.numeric(obj[1]), b = as.numeric(obj[2])))
-  }
-  # if saved as the equation string
-  if (is.character(obj) && length(obj) == 1) {
-    # expected like: "y = 0.012345 * x + 0.502345"
-    m <- suppressWarnings(as.numeric(str_match(obj, "y\\s*=\\s*([+-]?[0-9\\.eE]+)\\s*\\*\\s*x")[,2]))
-    b <- suppressWarnings(as.numeric(str_match(obj, "\\+\\s*([+-]?[0-9\\.eE]+)\\s*$")[,2]))
-    if (!is.na(m) && !is.na(b)) return(list(m = m, b = b))
-  }
-  stop(sprintf("Could not parse units line from %s", path))
-}
-
-spread_coefs <- load_units_line("spread_units_line.qs")
-ou_coefs     <- load_units_line("ou_units_line.qs")
-
-# Compute probabilities on final_2025 (requires pick_margin & ou_pick_margin present)
-final_2025 <- final_2025 %>%
-  mutate(
-    spread_hit_probability = pmin(
-      pmax(spread_coefs$m * as.numeric(pick_margin)     + spread_coefs$b, 0), 1
-    ),
-    ou_hit_probability     = pmin(
-      pmax(ou_coefs$m     * as.numeric(ou_pick_margin) + ou_coefs$b,     0), 1
-    )
-  )
-
-calc_units <- function(p) {
-  ifelse(
-    is.na(p),
-    NA_integer_,
-    {
-      # 0 if < 52.5%
-      # 1 for [0.53,0.55), 2 for [0.55,0.57), 3 for [0.57,0.59), 4 for [0.59,0.61), 5 for >= 0.61
-      n <- floor((p - 0.53) / 0.02) + 1L
-      ifelse(p < 0.525, 0L, pmin(5L, pmax(0L, n)))
-    }
-  )
-}
-
-final_2025 <- final_2025 %>%
-  dplyr::mutate(
-    spread_unit = calc_units(spread_hit_probability),
-    ou_unit     = calc_units(ou_hit_probability)
-  )
-
-
-final_2025_out <- final_2025 %>%
-  dplyr::mutate(
-    team          = as.character(team),
-    opponent      = as.character(opponent),
-    best_book     = as.character(best_book),
-    best_ou_book  = as.character(best_ou_book),
-    ou_pick       = as.character(ou_pick)
-  )
 
 
 suppressPackageStartupMessages({
@@ -1285,9 +1184,6 @@ send_discord <- function(webhook, content = NULL, embeds = NULL,
   }
 }
 
-# ------------------------------------------------------------------
-# 2) Ensure audit table exists
-# ------------------------------------------------------------------
 ensure_line_state_table <- function(con) {
   DBI::dbExecute(con, '
     CREATE TABLE IF NOT EXISTS "GamePicksLineState" (
@@ -1324,6 +1220,22 @@ plus <- function(x, dig = 2) {
          ifelse(x >= 0, paste0("+", format(round(x, dig), nsmall = dig)),
                 format(round(x, dig), nsmall = dig)))
 }
+
+ensure_lines_seen_table <- function(con) {
+  DBI::dbExecute(con, '
+    CREATE TABLE IF NOT EXISTS "GamePicksLineSeen" (
+      id BIGINT NOT NULL,
+      field TEXT NOT NULL,
+      first_value DOUBLE PRECISION,
+      price_spread DOUBLE PRECISION,
+      price_over DOUBLE PRECISION,
+      price_under DOUBLE PRECISION,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (id, field)
+    );
+  ')
+}
+
 
 # ------------------------------------------------------------------
 # 3) NA -> non-NA detector and Discord notifier
@@ -1573,7 +1485,53 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
     upserted = nrow(cur_state)
   ))
 }
-con <- connect_neon()
+suppressPackageStartupMessages(library(RPostgres))
+
+Sys.setenv(
+  DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
+)
+
+connect_neon <- function() {
+  url <- Sys.getenv("DATABASE_URL", unset = "")
+  if (!nzchar(url)) stop("DATABASE_URL is not set")
+  
+  # Poolers can choke on this param; strip it if present
+  url <- sub("[&?]channel_binding=[^&]+", "", url)
+  
+  u <- httr::parse_url(url)
+  if (is.null(u$hostname)) stop("Malformed DATABASE_URL")
+  
+  dbname <- if (nzchar(u$path)) sub("^/", "", u$path) else ""
+  host   <- u$hostname
+  port   <- if (is.null(u$port)) 5432 else u$port
+  user   <- u$username
+  pass   <- u$password
+  sslm   <- if (!is.null(u$query$sslmode)) u$query$sslmode else "require"
+  
+  # IMPORTANT: no 'options=' here (pooler forbids it)
+  con <- DBI::dbConnect(
+    RPostgres::Postgres(),
+    dbname   = dbname,
+    host     = host,
+    port     = port,
+    user     = user,
+    password = pass,
+    sslmode  = sslm
+  )
+  
+  # Optional: set search_path at session level (allowed; ignore if restricted)
+  try(DBI::dbExecute(con, 'SET search_path TO public'), silent = TRUE)
+  
+  # Smoke test
+  DBI::dbGetQuery(con, "SELECT 1 AS ok;")
+  con
+}
+
+Sys.setenv(
+  DATABASE_URL = "postgresql://neondb_owner:npg_POip9LKGFAa6@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+)
+con <- connect_neon()  # uses the function you already defined
+
 
 stopifnot(DBI::dbIsValid(con))
 res <- post_new_line_picks_to_discord(con, webhook = GAME_PICK_WEBHOOK)

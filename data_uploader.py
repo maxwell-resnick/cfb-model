@@ -657,6 +657,16 @@ try:
 except Exception:
     pass
 
+# ----------------------------- IMPORTS --------------------------------
+import os
+import re
+import ssl
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine, text, inspect
+
 # ----------------------------- CONFIG ---------------------------------
 TABLE = "PreparedData"
 KEYS  = ["id", "team", "opponent"]
@@ -714,6 +724,8 @@ def canon(df_slice: pd.DataFrame) -> pd.DataFrame:
     # DATES: to UTC -> epoch seconds (Int64)
     for c in (set(DEFAULT_DATE_COLS) & set(x.columns)):
         dt = pd.to_datetime(x[c], errors="coerce", utc=True)
+        # dt.view("int64") deprecations: use .astype("int64", errors="ignore") won't coerce NA properly.
+        # Use .astype("int64") on dt.astype("int64") is ok because we coerced above.
         epoch = (dt.view("int64") // 1_000_000_000)
         x[c] = pd.Series(epoch, index=x.index).astype("Int64")
 
@@ -819,8 +831,10 @@ def main(model_df: pd.DataFrame) -> None:
             modN = modN[nonkey_cols]
             dbN  = dbN[nonkey_cols]
 
-            # cell-wise equality after canon
-            eq = (modN.eq(dbN)) | (modN.isna() & dbN.isna())
+            # cell-wise equality after canon — boolean (no NA):
+            # equal if values equal OR both NA; otherwise False (changed)
+            eq = modN.eq(dbN) | (modN.isna() & dbN.isna())
+            eq = eq.fillna(False)  # safety: guarantee pure bool frame
 
             # summaries
             diff_summary = {c: int((~eq[c]).sum()) for c in modN.columns}
@@ -828,18 +842,15 @@ def main(model_df: pd.DataFrame) -> None:
             # masks
             mask_any_change = (~eq).any(axis=1)
 
-            global INCLUDE_STARTDATE_CHANGES
-            if INCLUDE_STARTDATE_CHANGES:
-                mask_real_change = mask_any_change
-                mask_only_ignored = pd.Series(False, index=eq.index)
+            # Which columns count for "real" change?
+            kept_cols = [c for c in eq.columns if (INCLUDE_STARTDATE_CHANGES or c not in IGNORE_FOR_DIFF)]
+            if kept_cols:
+                mask_real_change = (~eq[kept_cols]).any(axis=1)
+                mask_only_ignored = mask_any_change & eq[kept_cols].all(axis=1)
             else:
-                kept_cols = [c for c in eq.columns if c not in IGNORE_FOR_DIFF]
-                mask_real_change = (~eq[kept_cols]).any(axis=1) if kept_cols else pd.Series(False, index=eq.index)
-                # changed but all changes live in ignored columns
-                if kept_cols:
-                    mask_only_ignored = mask_any_change & eq[kept_cols].all(axis=1)
-                else:
-                    mask_only_ignored = mask_any_change
+                # if everything is ignored, then nothing is "real" change
+                mask_real_change = pd.Series(False, index=eq.index)
+                mask_only_ignored = mask_any_change
 
             # rows changed in at least one NON-ignored column
             changed_keys_idx = modN.index[mask_real_change]
@@ -859,11 +870,14 @@ def main(model_df: pd.DataFrame) -> None:
                 if ign and not INCLUDE_STARTDATE_CHANGES:
                     print("FYI: changes occurred ONLY in ignored columns (not upserting these):", ign)
 
-            # Example prints for ignored-only cases
+            # Example prints for ignored-only cases (NA-safe)
             if n_onlyI:
                 ex = list(modN.index[mask_only_ignored])[:5]
                 for idx in ex:
-                    ch_cols = [c for c in nonkey_cols if c in eq.columns and not eq.loc[idx, c]]
+                    row_eq = eq.loc[idx, nonkey_cols]
+                    # columns where equality != True are "changed"
+                    changed_mask = row_eq.ne(True)
+                    ch_cols = list(changed_mask.index[changed_mask])
                     gid, gteam, gopp = idx
                     print("ONLY_IGNORED_CHANGE",
                           f"id={gid} team={gteam} opponent={gopp} changed_cols={ch_cols}")
@@ -874,15 +888,23 @@ def main(model_df: pd.DataFrame) -> None:
     # 9) Discord-friendly per-row diffs (ignoring startDate-only unless INCLUDE_STARTDATE_CHANGES)
     if not db_trim.empty and not model_trim.empty and 'eq' in locals():
         nonkey_cols = [c for c in common_cols if c not in KEYS and c != "date_updated"]
-        all_changed_idx = eq.all(axis=1).index[~eq.all(axis=1)]
+        # BUGFIX: this used to do eq.all(axis=1).index[~eq.all(axis=1)] which is wrong.
+        all_changed_idx = eq.index[~eq.all(axis=1)]
         for idx in all_changed_idx:
-            ch_cols = [c for c in nonkey_cols if (c in eq.columns and not eq.loc[idx, c])]
-            if not INCLUDE_STARTDATE_CHANGES and set(ch_cols).issubset(IGNORE_FOR_DIFF):
-                continue  # only ignored columns changed
+            row_eq = eq.loc[idx, nonkey_cols]
+            changed_mask = row_eq.ne(True)  # True where different
+            ch_cols_all = list(changed_mask.index[changed_mask])
+
+            # filter out ignored-only if needed
+            if not INCLUDE_STARTDATE_CHANGES:
+                ch_cols = [c for c in ch_cols_all if c not in IGNORE_FOR_DIFF]
+                if not ch_cols:
+                    continue
+            else:
+                ch_cols = ch_cols_all
+
             parts = []
             for c in ch_cols:
-                if not INCLUDE_STARTDATE_CHANGES and c in IGNORE_FOR_DIFF:
-                    continue
                 old_v = db_idx.loc[idx, c] if c in db_idx.columns else pd.NA
                 new_v = model_idx.loc[idx, c] if c in model_idx.columns else pd.NA
                 parts.append(f"{c}: {_fmt(old_v)} -> {_fmt(new_v)}")

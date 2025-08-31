@@ -1,8 +1,22 @@
-source("kalman_filter.R")
+# --- deps ---
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(DBI)
+library(RPostgres)
+library(httr)
+library(lubridate)
+library(slider)  # for slide_dbl
 
+# ------------------------------------------------------------------
+# Fallback for numFactor if not already defined by another package
+# ------------------------------------------------------------------
+if (!exists("numFactor")) {
+  numFactor <- function(x) as.integer(as.factor(x))
+}
+
+# --- utils ---
 connect_neon <- function() {
-  library(DBI); library(RPostgres); library(httr)
-  
   url <- Sys.getenv("DATABASE_URL", unset = "")
   if (nzchar(url)) {
     pu <- httr::parse_url(url)
@@ -20,7 +34,6 @@ connect_neon <- function() {
     pass <- Sys.getenv("PGPASSWORD")
     ssl  <- Sys.getenv("PGSSLMODE", "require")
   }
-  
   stopifnot(nzchar(host), nzchar(db), nzchar(user), nzchar(pass))
   DBI::dbConnect(
     RPostgres::Postgres(),
@@ -33,47 +46,78 @@ connect_neon <- function() {
   )
 }
 
+# ---- helpers for robust sportsbook parsing & averaging ----
+normalize_ascii <- function(x) {
+  x <- as.character(x)
+  # unify minus/dashes
+  x <- gsub("\u2212|\u2012|\u2013|\u2014|\u2015", "-", x, perl = TRUE)   # −, ‒, –, —, ―
+  # unicode fractions → decimals
+  x <- gsub("\u00bd", ".5", x, perl = TRUE)  # ½
+  x <- gsub("\u00bc", ".25", x, perl = TRUE) # ¼
+  x <- gsub("\u00be", ".75", x, perl = TRUE) # ¾
+  # trim spaces
+  x <- gsub("[[:space:]]+", "", x, perl = TRUE)
+  x
+}
+parse_spread <- function(x) {
+  if (is.null(x)) return(NA_real_)
+  x <- normalize_ascii(x)
+  x <- toupper(x)
+  x[x %in% c("PK","PICK","PICKEM","PICK'EM","EVEN","EV")] <- "0"
+  # keep only sign, digits, dot
+  x <- gsub("[^0-9+\\-\\.]", "", x, perl = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+parse_total <- function(x) {
+  if (is.null(x)) return(NA_real_)
+  x <- normalize_ascii(x)
+  x <- gsub("[^0-9\\.]", "", x, perl = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+row_mean_na <- function(...) {
+  m <- cbind(...)
+  out <- rowMeans(m, na.rm = TRUE)
+  out[is.nan(out)] <- NA_real_
+  out
+}
+
+# ===============================
+# 1) PULL RAW DATA (2020–2024) & BUILD ROLLING FEATURES
+# ===============================
 con <- connect_neon()
-
-xgb_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season between 2020 and 2024;')
-
-pregame_latents <- get_pregame_latents()
+xgb_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season BETWEEN 2020 AND 2024;')
+dbDisconnect(con)
 
 xgb_df <- xgb_df %>%
   mutate(
-    # robust parse of ISO timestamps; NAs if missing/invalid
     start_dt = suppressWarnings(ymd_hms(startDate, quiet = TRUE))
   ) %>%
-  # team-side game index within (team, season)
+  # team-side & opponent-side game indices (within season)
   arrange(team, season, start_dt, .by_group = FALSE) %>%
   group_by(team, season) %>%
   mutate(team_game_number = row_number()) %>%
   ungroup() %>%
-  # opponent-side game index within (opponent, season)
   arrange(opponent, season, start_dt, .by_group = FALSE) %>%
   group_by(opponent, season) %>%
   mutate(opponent_game_number = row_number()) %>%
-  ungroup()
-
-# --- Usual modeling transforms ---
-xgb_df <- xgb_df %>%
+  ungroup() %>%
+  # transforms used by models/features
   mutate(
-    season_num = numFactor(season),
-    # use game-number indices instead of week
-    team_game_num = numFactor(team_game_number),
-    opp_game_num  = numFactor(opponent_game_number),
+    season_num     = numFactor(season),
+    team_game_num  = numFactor(team_game_number),
+    opp_game_num   = numFactor(opponent_game_number),
     
     team_f     = factor(team),
     opponent_f = factor(opponent),
     
     passing_plays = offense_passingPlays.totalPPA / offense_passingPlays.ppa,
     rushing_plays = offense_rushingPlays.totalPPA / offense_rushingPlays.ppa,
-    total_plays = passing_plays + rushing_plays,
+    total_plays   = passing_plays + rushing_plays,
     passing_rate  = passing_plays / (passing_plays + rushing_plays),
     
-    points_above_average          = offense_ppa * 65,
-    passing_points_above_average  = offense_passingPlays.ppa * 65,
-    rushing_points_above_average  = offense_rushingPlays.ppa * 65,
+    points_above_average         = offense_ppa * 65,
+    passing_points_above_average = offense_passingPlays.ppa * 65,
+    rushing_points_above_average = offense_rushingPlays.ppa * 65,
     
     is_home = ifelse(homeTeam == team, 1, 0)
   ) %>%
@@ -84,6 +128,7 @@ xgb_df <- xgb_df %>%
   ) %>%
   ungroup()
 
+# percentPPA map by (season, team)
 ppa_map <- xgb_df %>%
   transmute(
     season = as.integer(season),
@@ -91,57 +136,87 @@ ppa_map <- xgb_df %>%
     percentPPA = suppressWarnings(as.numeric(percentPPA))
   ) %>%
   group_by(season, team) %>%
-  summarise(
-    percentPPA = dplyr::first(percentPPA[!is.na(percentPPA)]),
-    .groups = "drop"
-  )
+  summarise(percentPPA = dplyr::first(percentPPA[!is.na(percentPPA)]), .groups = "drop")
 
-
+# -----------------------------
+# Sportsbook parsing & canonical averages
+# -----------------------------
 xgb_df <- xgb_df %>%
+  # Parse to numeric FIRST
   mutate(
-    # --- Bovada ---
+    # Bovada
+    bovada_spread_n              = parse_spread(bovada_spread),
+    bovada_opening_spread_n      = parse_spread(bovada_opening_spread),
+    bovada_total_n               = parse_total(bovada_overunder),
+    bovada_opening_total_n       = parse_total(bovada_opening_overunder),
+    # ESPN Bet
+    espnbet_spread_n             = parse_spread(espnbet_spread),
+    espnbet_opening_spread_n     = parse_spread(espnbet_opening_spread),
+    espnbet_total_n              = parse_total(espnbet_overunder),
+    espnbet_opening_total_n      = parse_total(espnbet_opening_overunder),
+    # DraftKings
+    draftkings_spread_n          = parse_spread(draftkings_spread),
+    draftkings_opening_spread_n  = parse_spread(draftkings_opening_spread),
+    draftkings_total_n           = parse_total(draftkings_overunder),
+    draftkings_opening_total_n   = parse_total(draftkings_opening_overunder)
+  ) %>%
+  # Apply home/away sign AFTER parsing (home: negative spread for the team row)
+  mutate(
     bovada_formatted_spread = case_when(
-      is_home == 1L ~ -bovada_spread,
-      is_home == 0L ~  bovada_spread,
+      is_home == 1L ~ -bovada_spread_n,
+      is_home == 0L ~  bovada_spread_n,
       TRUE          ~ NA_real_
     ),
     bovada_formatted_opening_spread = case_when(
-      is_home == 1L ~ -bovada_opening_spread,
-      is_home == 0L ~  bovada_opening_spread,
+      is_home == 1L ~ -bovada_opening_spread_n,
+      is_home == 0L ~  bovada_opening_spread_n,
       TRUE          ~ NA_real_
     ),
-    bovada_formatted_overunder         = bovada_overunder,
-    bovada_formatted_opening_overunder = bovada_opening_overunder,
-    
-    # --- ESPN Bet ---
     espnbet_formatted_spread = case_when(
-      is_home == 1L ~ -espnbet_spread,
-      is_home == 0L ~  espnbet_spread,
+      is_home == 1L ~ -espnbet_spread_n,
+      is_home == 0L ~  espnbet_spread_n,
       TRUE          ~ NA_real_
     ),
     espnbet_formatted_opening_spread = case_when(
-      is_home == 1L ~ -espnbet_opening_spread,
-      is_home == 0L ~  espnbet_opening_spread,
+      is_home == 1L ~ -espnbet_opening_spread_n,
+      is_home == 0L ~  espnbet_opening_spread_n,
       TRUE          ~ NA_real_
     ),
-    espnbet_formatted_overunder         = espnbet_overunder,
-    espnbet_formatted_opening_overunder = espnbet_opening_overunder,
-    
-    # --- DraftKings ---
     draftkings_formatted_spread = case_when(
-      is_home == 1L ~ -draftkings_spread,
-      is_home == 0L ~  draftkings_spread,
+      is_home == 1L ~ -draftkings_spread_n,
+      is_home == 0L ~  draftkings_spread_n,
       TRUE          ~ NA_real_
     ),
     draftkings_formatted_opening_spread = case_when(
-      is_home == 1L ~ -draftkings_opening_spread,
-      is_home == 0L ~  draftkings_opening_spread,
+      is_home == 1L ~ -draftkings_opening_spread_n,
+      is_home == 0L ~  draftkings_opening_spread_n,
       TRUE          ~ NA_real_
     ),
-    draftkings_formatted_overunder         = draftkings_overunder,
-    draftkings_formatted_opening_overunder = draftkings_opening_overunder
+    # Totals (over/under) don't depend on home/away
+    bovada_formatted_overunder              = bovada_total_n,
+    bovada_formatted_opening_overunder      = bovada_opening_total_n,
+    espnbet_formatted_overunder             = espnbet_total_n,
+    espnbet_formatted_opening_overunder     = espnbet_opening_total_n,
+    draftkings_formatted_overunder          = draftkings_total_n,
+    draftkings_formatted_opening_overunder  = draftkings_opening_total_n
+  ) %>%
+  # Average across books, ignoring NAs
+  mutate(
+    formatted_spread = row_mean_na(
+      bovada_formatted_spread, espnbet_formatted_spread, draftkings_formatted_spread
+    ),
+    formatted_opening_spread = row_mean_na(
+      bovada_formatted_opening_spread, espnbet_formatted_opening_spread, draftkings_formatted_opening_spread
+    ),
+    formatted_overunder = row_mean_na(
+      bovada_formatted_overunder, espnbet_formatted_overunder, draftkings_formatted_overunder
+    ),
+    formatted_opening_overunder = row_mean_na(
+      bovada_formatted_opening_overunder, espnbet_formatted_opening_overunder, draftkings_formatted_opening_overunder
+    )
   )
 
+# Keys + outcomes + attach percentPPA
 spread_scores_keys <- xgb_df %>%
   mutate(
     id       = as.integer(id),
@@ -150,7 +225,6 @@ spread_scores_keys <- xgb_df %>%
     team     = as.character(team_f),
     opponent = as.character(opponent_f),
     
-    # team-centric points using is_home (1 = home, 0 = away)
     team_points = case_when(
       is_home == 1L ~ homePoints,
       is_home == 0L ~ awayPoints,
@@ -163,7 +237,6 @@ spread_scores_keys <- xgb_df %>%
     ),
     score_diff = team_points - opponent_points
   ) %>%
-  # attach team/opponent percentPPA from the map
   left_join(ppa_map %>% rename(team_percentPPA = percentPPA),
             by = c("season", "team")) %>%
   left_join(ppa_map %>% rename(opponent_percentPPA = percentPPA),
@@ -171,19 +244,21 @@ spread_scores_keys <- xgb_df %>%
   select(
     id, season, week, team, opponent,
     
-    # Bovada (formatted + raw)
+    # keep the averaged canonical features
+    formatted_spread, formatted_opening_spread,
+    formatted_overunder, formatted_opening_overunder,
+    
+    # (optional) keep per-book formatted + raw too
     bovada_formatted_spread, bovada_formatted_opening_spread,
     bovada_formatted_overunder, bovada_formatted_opening_overunder,
     bovada_spread, bovada_opening_spread,
     bovada_overunder, bovada_opening_overunder,
     
-    # ESPN Bet (formatted + raw)
     espnbet_formatted_spread, espnbet_formatted_opening_spread,
     espnbet_formatted_overunder, espnbet_formatted_opening_overunder,
     espnbet_spread, espnbet_opening_spread,
     espnbet_overunder, espnbet_opening_overunder,
     
-    # DraftKings (formatted + raw)
     draftkings_formatted_spread, draftkings_formatted_opening_spread,
     draftkings_formatted_overunder, draftkings_formatted_opening_overunder,
     draftkings_spread, draftkings_opening_spread,
@@ -194,105 +269,89 @@ spread_scores_keys <- xgb_df %>%
     team_talent_scaled, opponent_talent_scaled,
     team_percentPPA, opponent_percentPPA,
     passing_rate, total_plays, is_home, startDate,
-    homePoints, awayPoints
+    homePoints, awayPoints, start_dt
   ) %>%
   distinct(season, week, team, opponent, .keep_all = TRUE)
 
-combined_df <- pregame_latents %>%
-  left_join(spread_scores_keys, by = c("season","week","team","opponent"))
-
-avg3 <- function(a, b, c) {
-  n <- (!is.na(a)) + (!is.na(b)) + (!is.na(c))
-  (coalesce(a, 0) + coalesce(b, 0) + coalesce(c, 0)) / ifelse(n == 0, NA_real_, n)
-}
-
-combined_df <- combined_df %>%
+# --- build a spread to use in modeling: prefer opening, fallback to closing ---
+combined_features <- spread_scores_keys %>%
   mutate(
-    across(
-      c(
-        bovada_formatted_spread, espnbet_formatted_spread, draftkings_formatted_spread,
-        bovada_formatted_opening_spread, espnbet_formatted_opening_spread, draftkings_formatted_opening_spread,
-        bovada_formatted_overunder, espnbet_formatted_overunder, draftkings_formatted_overunder,
-        bovada_formatted_opening_overunder, espnbet_formatted_opening_overunder, draftkings_formatted_opening_overunder
-      ),
-      ~ suppressWarnings(as.numeric(.))
-    ),
-    # canonical, averaged across books (ignore NAs)
-    formatted_spread = avg3(
-      bovada_formatted_spread, espnbet_formatted_spread, draftkings_formatted_spread
-    ),
-    formatted_opening_spread = avg3(
-      bovada_formatted_opening_spread, espnbet_formatted_opening_spread, draftkings_formatted_opening_spread
-    ),
-    formatted_overunder = avg3(
-      bovada_formatted_overunder, espnbet_formatted_overunder, draftkings_formatted_overunder
-    ),
-    formatted_opening_overunder = avg3(
-      bovada_formatted_opening_overunder, espnbet_formatted_opening_overunder, draftkings_formatted_opening_overunder
-    )
-  )
-
-combined_df <- combined_df %>%
-  mutate(
+    is_completed = !is.na(homePoints) & !is.na(awayPoints),
     startDate = as.POSIXct(startDate, tz = "UTC"),
-    total_plays = suppressWarnings(as.numeric(total_plays)),
-    formatted_opening_spread = suppressWarnings(as.numeric(formatted_opening_spread)),
-    is_completed = !is.na(homePoints) & !is.na(awayPoints)
+    # if opening is missing, fall back to closing
+    f_opening_spread = dplyr::coalesce(formatted_opening_spread, formatted_spread)
   )
 
-# 1) Fit simple LMs on COMPLETED games only
+# Guardrails
+stopifnot(all(c("f_opening_spread","passing_rate","total_plays") %in% names(combined_features)))
+
+# --- fit LMs on COMPLETED rows with a usable spread ---
 lm_pr <- lm(
-  passing_rate ~ formatted_opening_spread,
-  data = combined_df %>%
-    filter(is_completed, !is.na(passing_rate), !is.na(formatted_opening_spread))
+  passing_rate ~ f_opening_spread,
+  data = combined_features %>%
+    filter(is_completed, !is.na(passing_rate), !is.na(f_opening_spread))
 )
 lm_tp <- lm(
-  total_plays ~ formatted_opening_spread,
-  data = combined_df %>%
-    filter(is_completed, !is.na(total_plays), !is.na(formatted_opening_spread))
+  total_plays ~ f_opening_spread,
+  data = combined_features %>%
+    filter(is_completed, !is.na(total_plays), !is.na(f_opening_spread))
 )
 
-print(summary(lm_pr))
-print(summary(lm_tp))
+summary(lm_pr)
+summary(lm_tp)
 
-# 2) Vectorized predictions to avoid predict() dropping rows
 b_pr <- coef(lm_pr); b_tp <- coef(lm_tp)
-b0_pr <- unname(b_pr["(Intercept)"]);                  b1_pr <- unname(b_pr["formatted_opening_spread"])
-b0_tp <- unname(b_tp["(Intercept)"]);                  b1_tp <- unname(b_tp["formatted_opening_spread"])
+b0_pr <- unname(b_pr["(Intercept)"]);  b1_pr <- unname(b_pr["f_opening_spread"])
+b0_tp <- unname(b_tp["(Intercept)"]);  b1_tp <- unname(b_tp["f_opening_spread"])
 
-combined_df <- combined_df %>%
+# --- helper: rolling mean of previous k residuals with a minimum required count ---
+roll_prev_mean <- function(x, k = 12, min_n = 6) {
+  slider::slide_dbl(
+    x,
+    .f = function(w) {
+      w <- w[!is.na(w)]
+      if (length(w) < min_n) return(NA_real_)
+      # use up to last k values from what's available
+      mean(tail(w, min(k, length(w))))
+    },
+    .before = k - 1L,   # window covers previous k items IF you give it lagged x
+    .complete = FALSE
+  )
+}
+
+# --- predictions, residuals, and rolling features (past-only) ---
+combined_features <- combined_features %>%
   mutate(
-    pr_pred = b0_pr + b1_pr * formatted_opening_spread,
-    tp_pred = b0_tp + b1_tp * formatted_opening_spread,
-    pr_resid = if_else(is_completed & !is.na(passing_rate), passing_rate - pr_pred, NA_real_),
-    tp_resid = if_else(is_completed & !is.na(total_plays),  total_plays  - tp_pred, NA_real_)
+    pr_pred = b0_pr + b1_pr * f_opening_spread,
+    tp_pred = b0_tp + b1_tp * f_opening_spread,
+    pr_resid = if_else(is_completed & !is.na(passing_rate) & !is.na(pr_pred),
+                       passing_rate - pr_pred, NA_real_),
+    tp_resid = if_else(is_completed & !is.na(total_plays) & !is.na(tp_pred),
+                       total_plays - tp_pred, NA_real_)
   ) %>%
   group_by(team) %>%
-  arrange(startDate, .by_group = TRUE) %>%
+  arrange(start_dt, .by_group = TRUE) %>%
   mutate(
-    # 12-game rolling residuals (past only, unweighted, require 12 completed prior games)
-    rolling_passing_rate = slide_dbl(
-      lag(pr_resid),
-      .f = function(x) {
-        x <- x[!is.na(x)]
-        if (length(x) < 12) return(NA_real_)
-        mean(tail(x, 12))
-      },
-      .before = 11, .complete = TRUE
-    ),
-    rolling_total_plays = slide_dbl(
-      lag(tp_resid),
-      .f = function(x) {
-        x <- x[!is.na(x)]
-        if (length(x) < 12) return(NA_real_)
-        mean(tail(x, 12))
-      },
-      .before = 11, .complete = TRUE
-    )
+    # lag() ensures we only use PRIOR games; k = 12, but allow partial with min_n
+    rolling_passing_rate = roll_prev_mean(lag(pr_resid), k = 12, min_n = 2),
+    rolling_total_plays  = roll_prev_mean(lag(tp_resid), k = 12, min_n = 2)
   ) %>%
   ungroup()
 
+
+
+source("kalman_filter.R")
+
+pregame_latents <- get_pregame_latents()
+
+combined_df <- combined_features %>%
+  left_join(
+    pregame_latents,
+    by = c("season","week","team","opponent")
+  )
+
 model_df <- combined_df %>% filter(season >= 2021)
+
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -409,7 +468,7 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
       watchlist = list(train = dtr, val = dval),
       early_stopping_rounds = 20,
       maximize = FALSE,
-      verbose = 1
+      verbose = 2
     )
     
     best_it <- fit$best_iteration
@@ -443,7 +502,7 @@ set.seed(2025)
 opt <- bayesOpt(
   FUN = xgb_cv_score, bounds = bounds,
   initPoints = 10, iters.n = 100,
-  acq = "ei", parallel = FALSE, verbose = 1
+  acq = "ei", parallel = FALSE, verbose = 2
 )
 
 best_pars <- getBestPars(opt)

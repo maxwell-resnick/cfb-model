@@ -57,9 +57,9 @@ extract_ou_from_summary <- function(fit, groups = NULL) {
   if (is.null(groups)) {
     m <- regmatches(
       Ttxt,
-      regexpr("^([A-Za-z0-9_:.]+) (season_num|team_game_num|opp_game_num)\\(", Ttxt)
+      regexpr("^([A-Za-z0-9_:.]+) (season_num|week_num|team_game_num|opp_game_num)\\(", Ttxt)
     )
-    groups <- if (length(m)) unique(sub(" (season_num|team_game_num|opp_game_num)\\(.*$", "", m)) else character(0)
+    groups <- if (length(m)) unique(sub(" (season_num|week_num|team_game_num|opp_game_num)\\(.*$", "", m)) else character(0)
   }
   if (!length(groups)) return(list())
   
@@ -68,27 +68,25 @@ extract_ou_from_summary <- function(fit, groups = NULL) {
     suppressWarnings(as.numeric(tail(xs, 1)))
   }
   first_line_idx <- function(g) {
-    hit <- grep(paste0("^", g, " (season_num|team_game_num|opp_game_num)\\("), Ttxt, perl = TRUE)
+    hit <- grep(paste0("^", g, " (season_num|week_num|team_game_num|opp_game_num)\\("), Ttxt, perl = TRUE)
     if (!length(hit)) return(NA_integer_)
     hit[1]
   }
   
   out <- setNames(vector("list", length(groups)), groups)
   for (g in groups) {
-    i1 <- first_line_idx(g)
-    if (is.na(i1)) next
+    i1 <- first_line_idx(g); if (is.na(i1)) next
     sdv <- last_number(Ttxt[i1])
     j <- NA_integer_
     for (k in (i1 + 1):length(Ttxt)) {
-      if (grepl("^(season_num|team_game_num|opp_game_num)\\(", Ttxt[k])) { j <- k; break }
-      if (grepl("^Groups\\s+\\S+", Ttxt[k]) || grepl("^\\S+\\s+(season_num|team_game_num|opp_game_num)\\(", Ttxt[k])) break
+      if (grepl("^(season_num|week_num|team_game_num|opp_game_num)\\(", Ttxt[k])) { j <- k; break }
+      if (grepl("^Groups\\s+\\S+", Ttxt[k]) || grepl("^\\S+\\s+(season_num|week_num|team_game_num|opp_game_num)\\(", Ttxt[k])) break
     }
     if (is.na(j)) next
     phi <- last_number(Ttxt[j])
     if (is.na(sdv) || is.na(phi)) next
     tau2 <- sdv^2
-    q    <- tau2 * (1 - phi^2)
-    out[[g]] <- list(tau2 = tau2, phi = phi, q = q)
+    out[[g]] <- list(tau2 = tau2, phi = phi, q = tau2 * (1 - phi^2))
   }
   out[!vapply(out, is.null, logical(1))]
 }
@@ -167,242 +165,276 @@ fixed_components <- function(fit, new_df) {
   )
 }
 
-kf_update_diag <- function(resid, m_vec, P_vec, sigma_e2) {
+kf_update_diag_glmm <- function(resid, m_vec, P_vec, sigma_e2) {
   S     <- sum(P_vec) + sigma_e2
   innov <- resid - sum(m_vec)
-  K     <- P_vec / S
-  m_new <- m_vec + K * innov
+  K_i   <- P_vec / S
+  m_new <- m_vec + K_i * innov
   P_new <- P_vec - (P_vec * P_vec) / S
-  list(m = m_new, P = P_new, K = K, S = S, innov = innov)
+  list(m = m_new, P = P_new, K = K_i, S = S, innov = innov)
 }
 
-# ============================================================
-# Kalman forward filter for OU states over:
-#   - season (team_f, opponent_f)
-#   - game-number within season (team_f:season, opponent_f:season)
-# If y is NA → prediction only (no update). No static intercepts. No HFA.
-# ============================================================
+kstep_predict_ou <- function(m_prev, P_prev, phi, tau2, k_steps) {
+  if (!is.finite(m_prev) || is.na(m_prev)) return(list(m = 0, P = tau2))
+  if (k_steps <= 0) k_steps <- 1L
+  phi2k <- phi^(2 * k_steps)
+  list(m = (phi^k_steps) * m_prev,
+       P = phi2k * P_prev + tau2 * (1 - phi2k))
+}
+
+# seeds with posterior variance from last training season
+extract_last_season_posterior <- function(fit, group, last_season_year, default_tau2) {
+  col_y <- paste0("season_num(", last_season_year, ")")
+  safe <- function(x) tryCatch(x, error = function(e) NULL)
+  re_obj <- safe(ranef(fit, condVar = TRUE)$cond[[group]])
+  
+  if (is.null(re_obj)) {
+    cf <- safe(coef(fit)$cond[[group]])
+    if (!is.null(cf) && col_y %in% names(cf)) {
+      df <- tibble::rownames_to_column(as.data.frame(cf), "grp")
+      return(tibble::tibble(team = sub(":.*$", "", df$grp),
+                            m = suppressWarnings(as.numeric(df[[col_y]])),
+                            P = rep(default_tau2, nrow(df))))
+    }
+    stop("Could not extract last-season posterior for group '", group, "'.")
+  }
+  
+  df <- as.data.frame(re_obj)
+  if (!any(names(df) == "..rowname..")) df <- tibble::rownames_to_column(df, "..rowname..")
+  teams <- sub(":.*$", "", df[["..rowname.."]])
+  means <- suppressWarnings(as.numeric(df[[col_y]]))
+  
+  Pvec <- {
+    PV <- attr(re_obj, "postVar")
+    if (!is.null(PV) && length(dim(PV)) == 3L) {
+      cols <- setdiff(colnames(df), "..rowname..")
+      j <- match(col_y, cols)
+      if (!is.na(j)) PV[j, j, ] else rep(default_tau2, length(means))
+    } else rep(default_tau2, length(means))
+  }
+  tibble::tibble(team = teams, m = means, P = Pvec)
+}
+
 kalman_forward_ou <- function(
-    fit, initial_train_data, future_df,
-    last_train_season
+    fit,
+    future_df,            # needs: season_num, week, start_dt, team_f, opponent_f, played
+    last_train_season,
+    obs_var_mult = 1.0
 ) {
   outcome_col <- .response_var(fit)
-  sigma_e2    <- sigma(fit)^2
+  sigma_e2    <- obs_var_mult * sigma(fit)^2
+  ou          <- extract_ou_from_summary(fit, groups = NULL)
   
-  ou <- extract_ou_from_summary(fit, groups = NULL)
   has_season_team <- "team_f"            %in% names(ou)
   has_season_opp  <- "opponent_f"        %in% names(ou)
-  has_game_team   <- "team_f:season"     %in% names(ou)
-  has_game_opp    <- "opponent_f:season" %in% names(ou)
+  has_week_team   <- "team_f:season"     %in% names(ou)
+  has_week_opp    <- "opponent_f:season" %in% names(ou)
   
-  # Seeds for season OU
+  # seeds (means; variance handled via tau2 fallback here)
   if (has_season_team) seed_off <- extract_last_season_blups(fit, "team_f",     last_train_season)
   if (has_season_opp)  seed_def <- extract_last_season_blups(fit, "opponent_f", last_train_season)
   
-  # Storage
-  season_off_tbl <- tibble(team = character(), season = integer(), m = numeric(), P = numeric())
-  season_def_tbl <- tibble(team = character(), season = integer(), m = numeric(), P = numeric())
-  # per (team, season) environments for game-number OU, tracking last index
-  game_off_env <- if (has_game_team) new.env(hash = TRUE, parent = emptyenv()) else NULL
-  game_def_env <- if (has_game_opp)  new.env(hash = TRUE, parent = emptyenv()) else NULL
-  
-  # Keep strictly > last_train_season, sorted by time
   df <- future_df %>%
-    filter(season_num >= last_train_season + 1L) %>%
-    arrange(season_num, start_dt, team)
+    dplyr::filter(season_num >= last_train_season + 1L) %>%
+    dplyr::arrange(season_num, start_dt, team_f) %>%
+    dplyr::mutate(played = as.logical(played))
   
   if (!nrow(df)) stop("No rows strictly after training season (", last_train_season, ").")
   
-  # Fixed effects
   fx <- fixed_components(fit, df)
-  y  <- df[[outcome_col]]  # NA for unplayed
+  
+  # IMPORTANT: do not update from unplayed rows
+  y <- df[[outcome_col]]
+  y[!df$played] <- NA_real_
   
   kstep_predict <- function(prev_m, prev_P, phi, tau2, k_steps) {
-    if (!is.finite(prev_m) || is.na(prev_m)) {
-      list(m = 0, P = tau2)  # first observation for that team-season
-    } else {
-      if (k_steps <= 0) k_steps <- 1L
-      phi_k <- phi^k_steps
-      m_k <- phi_k * prev_m
-      P_k <- (phi^(2*k_steps)) * prev_P + tau2 * (1 - phi^(2*k_steps))
-      list(m = m_k, P = P_k)
-    }
+    if (!is.finite(prev_m) || is.na(prev_m)) return(list(m = 0, P = tau2))
+    if (k_steps <= 0) k_steps <- 1L
+    phi2k <- phi^(2 * k_steps)
+    list(m = (phi^k_steps) * prev_m,
+         P = phi2k * prev_P + tau2 * (1 - phi2k))
   }
+  
+  season_off_tbl <- tibble::tibble(team = character(), season = integer(), m = numeric(), P = numeric())
+  season_def_tbl <- tibble::tibble(team = character(), season = integer(), m = numeric(), P = numeric())
+  week_off_env <- if (has_week_team) new.env(hash = TRUE, parent = emptyenv()) else NULL
+  week_def_env <- if (has_week_opp)  new.env(hash = TRUE, parent = emptyenv()) else NULL
   
   game_log <- vector("list", nrow(df))
   
   seasons <- sort(unique(df$season_num))
   for (s in seasons) {
-    dS <- filter(df, season_num == s)
+    dS <- dplyr::filter(df, season_num == s)
     teams_s <- sort(unique(c(as.character(dS$team_f), as.character(dS$opponent_f))))
     
-    # Season-level priors (offense)
     if (has_season_team) {
-      if (s == last_train_season + 1L) {
-        m_prev <- seed_off$m[match(teams_s, seed_off$team)]
-      } else {
-        prev_off <- filter(season_off_tbl, season == (s - 1L))
-        m_prev <- prev_off$m[match(teams_s, prev_off$team)]
-      }
-      m0 <- ou[["team_f"]]$phi * m_prev
-      P0 <- ou[["team_f"]]$tau2
-      st_off <- tibble(team = teams_s, season = s,
-                       m = replace(m0, is.na(m0), 0),
-                       P = P0)
-      season_off_tbl <- bind_rows(season_off_tbl, st_off)
+      m_prev <- if (s == last_train_season + 1L)
+        seed_off$m[match(teams_s, seed_off$team)]
+      else dplyr::filter(season_off_tbl, season == s - 1L)$m[match(teams_s, dplyr::filter(season_off_tbl, season == s - 1L)$team)]
+      season_off_tbl <- dplyr::bind_rows(season_off_tbl,
+                                         tibble::tibble(team = teams_s, season = s,
+                                                        m = dplyr::coalesce(ou[["team_f"]]$phi * m_prev, 0),
+                                                        P = ou[["team_f"]]$tau2))
     }
-    
-    # Season-level priors (defense)
     if (has_season_opp) {
-      if (s == last_train_season + 1L) {
-        m_prev <- seed_def$m[match(teams_s, seed_def$team)]
-      } else {
-        prev_def <- filter(season_def_tbl, season == (s - 1L))
-        m_prev <- prev_def$m[match(teams_s, prev_def$team)]
-      }
-      m0 <- ou[["opponent_f"]]$phi * m_prev
-      P0 <- ou[["opponent_f"]]$tau2
-      st_def <- tibble(team = teams_s, season = s,
-                       m = replace(m0, is.na(m0), 0),
-                       P = P0)
-      season_def_tbl <- bind_rows(season_def_tbl, st_def)
+      m_prev <- if (s == last_train_season + 1L)
+        seed_def$m[match(teams_s, seed_def$team)]
+      else dplyr::filter(season_def_tbl, season == s - 1L)$m[match(teams_s, dplyr::filter(season_def_tbl, season == s - 1L)$team)]
+      season_def_tbl <- dplyr::bind_rows(season_def_tbl,
+                                         tibble::tibble(team = teams_s, season = s,
+                                                        m = dplyr::coalesce(ou[["opponent_f"]]$phi * m_prev, 0),
+                                                        P = ou[["opponent_f"]]$tau2))
     }
     
-    # Reset per-season game-number trackers
-    if (has_game_team) rm(list = ls(game_off_env), envir = game_off_env)
-    if (has_game_opp)  rm(list = ls(game_def_env), envir = game_def_env)
+    if (has_week_team) rm(list = ls(week_off_env), envir = week_off_env)
+    if (has_week_opp)  rm(list = ls(week_def_env), envir = week_def_env)
     
-    # Iterate games in chronological order within the season
     idx_s <- which(df$season_num == s)
     for (i in idx_s) {
       team <- as.character(df$team_f[i])
       opp  <- as.character(df$opponent_f[i])
+      wk_i <- suppressWarnings(as.integer(df$week[i]))
       
-      # ---- Season OU states (already priored) ----
+      # season states (current)
       m_so <- if (has_season_team) season_off_tbl$m[which(season_off_tbl$team == team & season_off_tbl$season == s)] else NULL
       P_so <- if (has_season_team) season_off_tbl$P[which(season_off_tbl$team == team & season_off_tbl$season == s)] else NULL
       m_sd <- if (has_season_opp)  season_def_tbl$m[which(season_def_tbl$team == opp  & season_def_tbl$season == s)]  else NULL
       P_sd <- if (has_season_opp)  season_def_tbl$P[which(season_def_tbl$team == opp  & season_def_tbl$season == s)]  else NULL
       
-      # ---- Game-number OU states (team side) ----
-      if (has_game_team) {
-        key_team <- paste(team, s, sep = "||")
-        cur_idx  <- as.integer(df$team_game_number[i])
-        if (!exists(key_team, envir = game_off_env, inherits = FALSE)) {
-          po <- list(m = NA_real_, P = ou[["team_f:season"]]$tau2, last_idx = NA_integer_)
-        } else {
-          po <- get(key_team, envir = game_off_env)
-        }
-        k_steps <- if (is.na(po$last_idx)) 1L else max(1L, cur_idx - po$last_idx)
+      # week OU (offense)
+      if (has_week_team) {
+        key_off <- paste(team, s, sep = "||")
+        if (!exists(key_off, envir = week_off_env, inherits = FALSE)) {
+          po <- list(m = NA_real_, P = ou[["team_f:season"]]$tau2, last_wk = NA_integer_)
+        } else po <- get(key_off, envir = week_off_env)
+        k_steps <- if (is.na(po$last_wk)) 1L else max(1L, wk_i - po$last_wk)
         pred_o  <- kstep_predict(po$m, po$P, ou[["team_f:season"]]$phi, ou[["team_f:season"]]$tau2, k_steps)
         m_wt <- pred_o$m; P_wt <- pred_o$P
-        assign(key_team, list(m = m_wt, P = P_wt, last_idx = cur_idx), envir = game_off_env)
-      } else {
-        m_wt <- NULL; P_wt <- NULL
-      }
+        assign(key_off, list(m = m_wt, P = P_wt, last_wk = wk_i), envir = week_off_env)
+      } else { m_wt <- NULL; P_wt <- NULL }
       
-      # ---- Game-number OU states (opponent side) ----
-      if (has_game_opp) {
-        key_opp <- paste(opp, s, sep = "||")
-        cur_i2  <- as.integer(df$opponent_game_number[i])
-        if (!exists(key_opp, envir = game_def_env, inherits = FALSE)) {
-          pd <- list(m = NA_real_, P = ou[["opponent_f:season"]]$tau2, last_idx = NA_integer_)
-        } else {
-          pd <- get(key_opp, envir = game_def_env)
-        }
-        k_steps <- if (is.na(pd$last_idx)) 1L else max(1L, cur_i2 - pd$last_idx)
-        pred_d  <- kstep_predict(pd$m, pd$P, ou[["opponent_f:season"]]$phi, ou[["opponent_f:season"]]$tau2, k_steps)
+      # week OU (defense)
+      if (has_week_opp) {
+        key_def <- paste(opp, s, sep = "||")
+        if (!exists(key_def, envir = week_def_env, inherits = FALSE)) {
+          pd <- list(m = NA_real_, P = ou[["opponent_f:season"]]$tau2, last_wk = NA_integer_)
+        } else pd <- get(key_def, envir = week_def_env)
+        k_steps_def <- if (is.na(pd$last_wk)) 1L else max(1L, wk_i - pd$last_wk)
+        pred_d  <- kstep_predict(pd$m, pd$P, ou[["opponent_f:season"]]$phi, ou[["opponent_f:season"]]$tau2, k_steps_def)
         m_wo <- pred_d$m; P_wo <- pred_d$P
-        assign(key_opp, list(m = m_wo, P = P_wo, last_idx = cur_i2), envir = game_def_env)
-      } else {
-        m_wo <- NULL; P_wo <- NULL
-      }
+        assign(key_def, list(m = m_wo, P = P_wo, last_wk = wk_i), envir = week_def_env)
+      } else { m_wo <- NULL; P_wo <- NULL }
       
-      # Build vectors in fixed order
+      # build state vectors (+1 loadings, matching glmmTMB)
       m_vec <- c(if (has_season_team) m_so else NULL,
                  if (has_season_opp)  m_sd else NULL,
-                 if (has_game_team)   m_wt else NULL,
-                 if (has_game_opp)    m_wo else NULL)
+                 if (has_week_team)   m_wt else NULL,
+                 if (has_week_opp)    m_wo else NULL)
       P_vec <- c(if (has_season_team) P_so else NULL,
                  if (has_season_opp)  P_sd else NULL,
-                 if (has_game_team)   P_wt else NULL,
-                 if (has_game_opp)    P_wo else NULL)
+                 if (has_week_team)   P_wt else NULL,
+                 if (has_week_opp)    P_wo else NULL)
       
-      # PRE-GAME effects (prediction-only)
-      prior_season_team <- if (has_season_team) m_so else 0
-      prior_season_opp  <- if (has_season_opp)  m_sd else 0
-      prior_game_team   <- if (has_game_team)   m_wt else 0
-      prior_game_opp    <- if (has_game_opp)    m_wo else 0
-      
-      game_log[[i]] <- tibble(
+      # ---- PRE-GAME LOG (adds expected/observed opponent output) ----
+      state_sum <- sum(m_vec)
+      exp_y     <- fx$fixed_sum[i] + state_sum
+      obs_y     <- y[i]  # already NA for unplayed
+      game_log[[i]] <- tibble::tibble(
         season = s,
-        # keep original week for convenience if present
-        week = suppressWarnings(as.integer(df$week[i])),
+        week = wk_i,
         team = team,
         opponent = opp,
         team_talent_effect     = fx$team_talent_effect[i],
         opponent_talent_effect = fx$opponent_talent_effect[i],
-        prior_season_team = prior_season_team,
-        prior_season_opp  = prior_season_opp,
-        prior_week_team   = prior_game_team,  # naming kept for downstream compatibility
-        prior_week_opp    = prior_game_opp
+        prior_season_team = if (length(m_so)) m_so else 0,
+        prior_season_opp  = if (length(m_sd)) m_sd else 0,
+        prior_week_team   = if (length(m_wt)) m_wt else 0,
+        prior_week_opp    = if (length(m_wo)) m_wo else 0,
+        expected_opponent_output = exp_y,
+        observed_opponent_output = obs_y
       )
       
-      # UPDATE if observed
-      if (!is.na(y[i]) && length(m_vec)) {
-        resid_i <- y[i] - fx$fixed_sum[i]
-        up <- kf_update_diag(resid_i, m_vec, P_vec, sigma_e2)
+      # ---- POSTERIOR UPDATE (only when played) ----
+      if (!is.na(obs_y) && length(m_vec)) {
+        up <- kf_update_diag_glmm(obs_y - fx$fixed_sum[i], m_vec, P_vec, sigma_e2)
         cursor <- 1L
-        if (has_season_team) {
-          so_row <- which(season_off_tbl$team == team & season_off_tbl$season == s)
-          season_off_tbl$m[so_row] <- up$m[cursor]; season_off_tbl$P[so_row] <- up$P[cursor]; cursor <- cursor + 1L
-        }
-        if (has_season_opp) {
-          sd_row <- which(season_def_tbl$team == opp  & season_def_tbl$season == s)
-          season_def_tbl$m[sd_row] <- up$m[cursor]; season_def_tbl$P[sd_row] <- up$P[cursor]; cursor <- cursor + 1L
-        }
-        if (has_game_team) {
-          key_team <- paste(team, s, sep = "||")
-          cur <- get(key_team, envir = game_off_env); cur$m <- up$m[cursor]; cur$P <- up$P[cursor]
-          assign(key_team, cur, envir = game_off_env); cursor <- cursor + 1L
-        }
-        if (has_game_opp) {
-          key_opp <- paste(opp, s, sep = "||")
-          cur <- get(key_opp, envir = game_def_env); cur$m <- up$m[cursor]; cur$P <- up$P[cursor]
-          assign(key_opp, cur, envir = game_def_env); cursor <- cursor + 1L
-        }
+        if (has_season_team) { so_row <- which(season_off_tbl$team == team & season_off_tbl$season == s)
+        season_off_tbl$m[so_row] <- up$m[cursor]; season_off_tbl$P[so_row] <- up$P[cursor]; cursor <- cursor + 1L }
+        if (has_season_opp)  { sd_row <- which(season_def_tbl$team == opp  & season_def_tbl$season == s)
+        season_def_tbl$m[sd_row] <- up$m[cursor]; season_def_tbl$P[sd_row] <- up$P[cursor]; cursor <- cursor + 1L }
+        if (has_week_team)   { key_off <- paste(team, s, sep = "||")
+        cur <- get(key_off, envir = week_off_env); cur$m <- up$m[cursor]; cur$P <- up$P[cursor]
+        assign(key_off, cur, envir = week_off_env); cursor <- cursor + 1L }
+        if (has_week_opp)    { key_def <- paste(opp, s, sep = "||")
+        cur <- get(key_def, envir = week_def_env); cur$m <- up$m[cursor]; cur$P <- up$P[cursor]
+        assign(key_def, cur, envir = week_def_env); cursor <- cursor + 1L }
       }
-    } # end loop season i
-  }   # end seasons
+    }
+  }
   
-  fx_tbl <- bind_rows(game_log) %>%
-    transmute(
-      season, week, team, opponent,
-      offense_talent_effect = team_talent_effect,
-      offense_season_effect = prior_season_team,
-      offense_week_effect   = prior_week_team,  # "week" label retained
-      offense_effect        = offense_talent_effect + offense_season_effect + offense_week_effect,
-      defense_talent_effect = opponent_talent_effect,
-      defense_season_effect = prior_season_opp,
-      defense_week_effect   = prior_week_opp,
-      defense_effect        = defense_talent_effect + defense_season_effect + defense_week_effect
-    )
-  list(pregame = fx_tbl,
-       season_off = season_off_tbl,
-       season_def = season_def_tbl)
+  game_log_df <- dplyr::bind_rows(Filter(Negate(is.null), game_log))
+  if (is.null(game_log_df) || nrow(game_log_df) == 0L) {
+    return(list(
+      pregame = tibble::tibble(season=integer(), week=integer(), team=character(), opponent=character(),
+                               offense_effect=numeric(), defense_effect=numeric(),
+                               expected_opponent_output=numeric(), observed_opponent_output=numeric()),
+      season_off = season_off_tbl, season_def = season_def_tbl))
+  }
+  
+  fx_tbl <- game_log_df %>%
+    dplyr::mutate(
+      offense_random = prior_season_team + prior_week_team,
+      defense_random = prior_season_opp  + prior_week_opp,     # good defense => negative
+      offense_effect = team_talent_effect + offense_random,     # (no HFA here)
+      defense_effect = opponent_talent_effect + defense_random  # (no HFA here)
+    ) %>%
+    dplyr::select(season, week, team, opponent,
+                  offense_effect, defense_effect,
+                  expected_opponent_output, observed_opponent_output)
+  
+  list(pregame = fx_tbl, season_off = season_off_tbl, season_def = season_def_tbl)
 }
+
 
 run_pipeline <- function(fit, initial_train_data, future_df_aligned, last_train_season, label) {
   res <- kalman_forward_ou(
     fit                 = fit,
-    initial_train_data  = initial_train_data,
     future_df           = future_df_aligned,
     last_train_season   = last_train_season
   )
   res$pregame %>%
-    mutate(model = label) %>%
-    select(model, season, week, team, opponent, offense_effect, defense_effect)
+    dplyr::mutate(model = label) %>%
+    dplyr::select(model, season, week, team, opponent,
+                  offense_effect, defense_effect,
+                  expected_opponent_output, observed_opponent_output)
 }
+
+get_pregame_latents <- function() {
+  fit_overall <- qread("glmms/fit_overall.qs")
+  fit_passing <- qread("glmms/fit_passing.qs")
+  fit_rushing <- qread("glmms/fit_rushing.qs")
+  # ... (your data loading / future_df_aligned building stays the same)
+  
+  pregame_overall <- run_pipeline(fit_overall, model_df, future_df_aligned, 2020, "overall")
+  pregame_passing <- run_pipeline(fit_passing, model_df, future_df_aligned, 2020, "passing")
+  pregame_rushing <- run_pipeline(fit_rushing, model_df, future_df_aligned, 2020, "rushing")
+  
+  pregame_latents_all <- dplyr::bind_rows(pregame_overall, pregame_passing, pregame_rushing)
+  
+  pregame_latents_all %>%
+    dplyr::distinct(season, week, team, opponent, model,
+                    offense_effect, defense_effect,
+                    expected_opponent_output, observed_opponent_output) %>%
+    tidyr::pivot_wider(
+      id_cols    = c(season, week, team, opponent),
+      names_from = model,
+      values_from = c(offense_effect, defense_effect,
+                      expected_opponent_output, observed_opponent_output),
+      names_glue = "{.value}_{model}"
+    ) %>%
+    dplyr::arrange(season, week, team, opponent)
+}
+
 
 # ============================
 # ==== EXECUTION PIPELINE  ====
@@ -565,3 +597,4 @@ get_pregame_latents <- function() {
   
   return(pregame_latents)
 }
+
