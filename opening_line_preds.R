@@ -1085,8 +1085,12 @@ final_2025_out <- picks_2025 %>%
     by = "id"
   ) %>%
   # pretty strings
-  dplyr::mutate(
-    spread_pick = dplyr::if_else(
+  mutate(best_line = -best_line,
+      dk_formatted_spread = -dk_formatted_spread,
+      fd_formatted_spread = -fd_formatted_spread,
+      mgm_formatted_spread = -mgm_formatted_spread,
+      espnbet_formatted_spread = -espnbet_formatted_spread,
+      spread_pick = dplyr::if_else(
       is.na(team) | is.na(best_line), NA_character_,
       paste0(team, " ", fmt_line(best_line))
     ),
