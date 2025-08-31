@@ -652,8 +652,8 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
     ),
     
     # Implied team totals (same formulas you had)
-    vegas_opening_team_points = (formatted_opening_overunder + formatted_opening_spread) / 2,
-    vegas_team_points         = (formatted_overunder         + formatted_spread)         / 2
+    vegas_opening_team_points = (formatted_opening_overunder - formatted_opening_spread) / 2,
+    vegas_team_points         = (formatted_overunder         - formatted_spread)         / 2
   )
 
 con <- connect_neon()
@@ -823,7 +823,7 @@ opp_preds_2025 <- pred_2025 %>%
 
 pred_2025 <- pred_2025 %>%
   dplyr::left_join(opp_preds_2025, by = c("id", "opponent")) %>%
-  dplyr::mutate(pred_spread = pred_team_points - pred_opponent_points)
+  dplyr::mutate(pred_spread = pred_opponent_points - pred_team_points)
 
 pred_2025 <- pred_2025 %>%
   dplyr::mutate(
@@ -1093,30 +1093,6 @@ picks_totals_2025 <- pred_2025 %>%
 
 stopifnot(anyDuplicated(picks_totals_2025$id) == 0)
 
-# -----------------------------
-# Helpers for flipping & pretty strings
-# -----------------------------
-flip_spread_lines <- function(df) {
-  spread_like  <- grep("spread", names(df), value = TRUE)
-  spread_lines <- setdiff(spread_like, grep("price|total", spread_like, value = TRUE))
-  spread_lines <- unique(c(spread_lines, intersect(c("best_line", "pred_spread"), names(df))))
-  if (length(spread_lines)) {
-    df <- df %>% mutate(across(all_of(spread_lines), ~ -suppressWarnings(as.numeric(.))))
-  }
-  attr(df, "flipped_spread_cols") <- spread_lines
-  df
-}
-fmt_line <- function(x) {
-  ifelse(
-    is.na(x), NA_character_,
-    ifelse(x > 0, paste0("+", format(round(x, 1), nsmall = 1)),
-           format(round(x, 1), nsmall = 1))
-  )
-}
-
-# Flip spreads in picks_2025 and add readable picks
-picks_2025 <- flip_spread_lines(picks_2025)
-
 picks_2025 <- picks_2025 %>%
   mutate(
     spread_pick = ifelse(
@@ -1312,16 +1288,14 @@ send_discord <- function(webhook, content = NULL, embeds = NULL,
 # ------------------------------------------------------------------
 # 2) Ensure audit table exists
 # ------------------------------------------------------------------
-ensure_lines_seen_table <- function(con) {
+ensure_line_state_table <- function(con) {
   DBI::dbExecute(con, '
-    CREATE TABLE IF NOT EXISTS "GamePicksLineSeen" (
+    CREATE TABLE IF NOT EXISTS "GamePicksLineState" (
       id BIGINT NOT NULL,
       field TEXT NOT NULL,
-      first_value DOUBLE PRECISION,
-      price_spread DOUBLE PRECISION,
-      price_over DOUBLE PRECISION,
-      price_under DOUBLE PRECISION,
-      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      is_available BOOLEAN NOT NULL,
+      value DOUBLE PRECISION,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (id, field)
     );
   ')
@@ -1356,37 +1330,26 @@ plus <- function(x, dig = 2) {
 # ------------------------------------------------------------------
 post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, notify_when_none = TRUE) {
   stopifnot(DBI::dbIsValid(con))
-  ensure_lines_seen_table(con)
+  ensure_lines_seen_table(con)   # keeps your original audit ("first seen") if you still want it
+  ensure_line_state_table(con)   # NEW: maintains current state for each id/field
   
-  # fallback for `%||%` (dplyr/rlang style)
+  # fallback for `%||%`
   if (!exists("%||%", mode = "function")) {
     `%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || (is.atomic(x) && all(is.na(x)))) y else x
   }
-  
-  # simple Discord sender guard
-  if (!exists("send_discord", mode = "function")) {
-    stop("send_discord() is not defined in this session.")
-  }
+  if (!exists("send_discord", mode = "function")) stop("send_discord() is not defined in this session.")
   
   now_utc <- format(as.POSIXct(Sys.time(), tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ")
   
   notify_none <- function(reason = "(unspecified)") {
-    if (!notify_when_none) {
-      message("No-new-lines notification suppressed (notify_when_none = FALSE). Reason: ", reason)
-      return(FALSE)
-    }
-    if (!nzchar(webhook)) {
-      message("No-new-lines NOT sent: empty webhook. Reason: ", reason)
-      return(FALSE)
-    }
+    if (!notify_when_none) return(invisible(FALSE))
+    if (!nzchar(webhook))  return(invisible(FALSE))
     embed <- list(
-      title = "No new lines!",
-      description = paste0("No previously-NA lines turned non-NA as of ", now_utc, " (UTC).\nReason: ", reason),
+      title = "No line state changes",
+      description = paste0("As of ", now_utc, " (UTC): ", reason),
       color = 0x95A5A6
     )
-    ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
-    message(if (ok) "Sent 'No new lines' notice." else "Failed to send 'No new lines' notice.")
-    invisible(ok)
+    isTRUE(send_discord(webhook, embeds = list(embed)))
   }
   
   gp_cols <- DBI::dbGetQuery(
@@ -1402,154 +1365,214 @@ post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, not
   line_cols <- intersect(line_cols_all, gp_cols)
   if (!length(line_cols)) {
     sent <- notify_none("No watched line columns present in GamePicks.")
-    return(invisible(list(notified = as.integer(sent), inserted = 0L)))
+    return(invisible(list(notified = as.integer(sent), changes = 0L, upserted = 0L)))
   }
   
   pick_cols_all <- c(
     "spread_pick","best_book","pick_margin","spread_unit",
     "ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit",
-    "season","week","team","opponent","startDate"
+    "season","week","team","opponent","startDate",
+    "actual_total"
   )
+  
   pick_cols <- intersect(pick_cols_all, gp_cols)
   
   sel_cols <- unique(c("id", line_cols, pick_cols))
   q_cols   <- paste(sprintf('"%s"', sel_cols), collapse = ", ")
   gp <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "GamePicks";', q_cols))
   
-  cur_long <- gp |>
+  # -------- filter: eligible IDs for notification only --------
+  eligible_ids <- gp %>%
+    dplyr::mutate(
+      team     = as.character(team),
+      opponent = as.character(opponent)
+    ) %>%
+    { if ("actual_total" %in% names(.)) dplyr::filter(., is.na(actual_total)) else . } %>%
+    dplyr::filter(
+      # keep rows where neither team nor opponent contains "Test "
+      !stringr::str_detect(dplyr::coalesce(team, ""), stringr::fixed("Test ")) &
+        !stringr::str_detect(dplyr::coalesce(opponent, ""), stringr::fixed("Test "))
+    ) %>%
+    dplyr::pull(id) %>%
+    unique()
+  
+  # --- Current snapshot (unfiltered; we still track full state) ---
+  cur_state <- gp |>
     tidyr::pivot_longer(
       cols = tidyselect::all_of(line_cols),
       names_to = "field",
-      values_to = "line"
+      values_to = "line_raw"
     ) |>
-    dplyr::filter(!is.na(line)) |>
-    dplyr::select(id, field, line)
-  
-  if (!nrow(cur_long)) {
-    sent <- notify_none("There are no currently non-NA lines.")
-    return(invisible(list(notified = as.integer(sent), inserted = 0L)))
-  }
-  
-  seen <- DBI::dbGetQuery(con, 'SELECT id, field FROM "GamePicksLineSeen";')
-  
-  new_rows <- dplyr::anti_join(cur_long, seen, by = c("id","field"))
-  if (!nrow(new_rows)) {
-    sent <- notify_none("All current non-NA lines were already announced.")
-    return(invisible(list(notified = as.integer(sent), inserted = 0L)))
-  }
-  
-  new_spread_ids <- new_rows |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique()
-  new_total_ids  <- new_rows |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique()
-  
-  if (!exists("plus", mode = "function")) {
-    plus <- function(x, dig = 2) {
-      ifelse(is.na(x), "NA",
-             ifelse(suppressWarnings(as.numeric(x)) >= 0,
-                    paste0("+", format(round(as.numeric(x), dig), nsmall = dig)),
-                    format(round(as.numeric(x), dig), nsmall = dig)))
-    }
-  }
-  
-  if (!exists("make_fields", mode = "function")) {
-    make_fields <- function(df) {
-      if (!nrow(df)) return(list())
-      lapply(seq_len(nrow(df)), function(i) as.list(df[i, c("name","value","inline")]))
-    }
-  }
-  
-  spreads_fields <- list()
-  if (length(new_spread_ids)) {
-    cols_needed <- intersect(c("id","season","week","team","opponent","spread_pick","best_book","pick_margin","spread_unit"), names(gp))
-    if (length(cols_needed)) {
-      df <- gp |>
-        dplyr::filter(id %in% new_spread_ids) |>
-        dplyr::select(dplyr::all_of(cols_needed)) |>
-        dplyr::mutate(
-          spread_unit = suppressWarnings(as.integer(spread_unit)),
-          pick_margin = suppressWarnings(as.numeric(pick_margin)),
-          title = sprintf("SPREAD — %s vs %s (Wk %s, %s)",
-                          team %||% "NA", opponent %||% "NA",
-                          as.character(week %||% NA), as.character(season %||% NA)),
-          value = sprintf("%s  |  %s  |  edge %s  |  units %s",
-                          spread_pick %||% "NA",
-                          best_book %||% "NA",
-                          plus(pick_margin, 2),
-                          ifelse(is.na(spread_unit), "NA", as.character(spread_unit)))
-        ) |>
-        dplyr::transmute(name = title, value = value, inline = FALSE)
-      spreads_fields <- make_fields(df)
-    }
-  }
-  
-  totals_fields <- list()
-  if (length(new_total_ids)) {
-    cols_needed <- intersect(c("id","season","week","team","opponent","ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit"), names(gp))
-    if (length(cols_needed)) {
-      df <- gp |>
-        dplyr::filter(id %in% new_total_ids) |>
-        dplyr::select(dplyr::all_of(cols_needed)) |>
-        dplyr::mutate(
-          ou_unit        = suppressWarnings(as.integer(ou_unit)),
-          ou_pick_margin = suppressWarnings(as.numeric(ou_pick_margin)),
-          title = sprintf("TOTAL — %s vs %s (Wk %s, %s)",
-                          team %||% "NA", opponent %||% "NA",
-                          as.character(week %||% NA), as.character(season %||% NA)),
-          pick_str = dplyr::coalesce(ou_pick_str,
-                                     ifelse(is.na(ou_pick), "(no pick)",
-                                            paste0(stringr::str_to_title(ou_pick), " ?"))),
-          value = sprintf("%s  |  %s  |  edge %s  |  units %s",
-                          pick_str %||% "NA",
-                          best_ou_book %||% "NA",
-                          plus(ou_pick_margin, 2),
-                          ifelse(is.na(ou_unit), "NA", as.character(ou_unit)))
-        ) |>
-        dplyr::transmute(name = title, value = value, inline = FALSE)
-      totals_fields <- make_fields(df)
-    }
-  }
-  
-  fields_all <- c(spreads_fields, totals_fields)
-  if (!length(fields_all)) {
-    sent <- notify_none("New lines detected but no pick fields could be constructed.")
-    return(invisible(list(notified = as.integer(sent), inserted = nrow(new_rows))))
-  }
-  
-  batches <- split(fields_all, ceiling(seq_along(fields_all) / 10))
-  sent <- 0L
-  for (i in seq_along(batches)) {
-    embed <- list(
-      title = sprintf("New lines posted (%d of %d)", i, length(batches)),
-      description = "Spread and Total picks for games where a line just became available.",
-      color = 0x3498db,
-      fields = batches[[i]]
+    dplyr::transmute(
+      id,
+      field,
+      is_available = !is.na(line_raw),
+      value = suppressWarnings(as.numeric(line_raw))
     )
-    ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
-    if (ok) sent <- sent + length(batches[[i]])
-    Sys.sleep(0.2)
+  
+  if (!nrow(cur_state)) {
+    sent <- notify_none("No rows returned from GamePicks.")
+    return(invisible(list(notified = as.integer(sent), changes = 0L, upserted = 0L)))
   }
   
-  stage_name <- DBI::Id(schema = NULL, table = "GamePicksLineSeen_stage")
+  # --- Previous snapshot from state table
+  prev_state <- DBI::dbGetQuery(
+    con,
+    'SELECT id, field, is_available AS prev_available, value AS prev_value FROM "GamePicksLineState";'
+  )
+  
+  # --- Compute transitions, then restrict to eligible IDs for notifications ---
+  changes <- cur_state |>
+    dplyr::left_join(prev_state, by = c("id","field")) |>
+    dplyr::mutate(
+      transition = dplyr::case_when(
+        (is.na(prev_available) | prev_available == FALSE) & (is_available == TRUE)  ~ "became_available",
+        (prev_available == TRUE)                          & (is_available == FALSE) ~ "became_missing",
+        TRUE ~ NA_character_
+      )
+    ) |>
+    dplyr::filter(!is.na(transition)) |>
+    dplyr::filter(id %in% eligible_ids)
+  
+  # --- Build Discord embeds for both directions (only eligible IDs) ---
+  enrich <- function(ids) {
+    if (!length(ids)) return(NULL)
+    cols_needed <- intersect(c(
+      "id","season","week","team","opponent",
+      "spread_pick","best_book","pick_margin","spread_unit",
+      "ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit"
+    ), names(gp))
+    if (!length(cols_needed)) return(NULL)
+    gp |>
+      dplyr::filter(id %in% ids) |>
+      dplyr::select(dplyr::all_of(cols_needed))
+  }
+  
+  became_avail   <- changes |> dplyr::filter(transition == "became_available")
+  became_missing <- changes |> dplyr::filter(transition == "became_missing")
+  
+  avail_spreads <- became_avail   |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique() |> enrich()
+  avail_totals  <- became_avail   |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique() |> enrich()
+  missing_spreads <- became_missing |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique() |> enrich()
+  missing_totals  <- became_missing |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique() |> enrich()
+  
+  fields <- list()
+  
+  if (!is.null(avail_spreads) && nrow(avail_spreads)) {
+    df <- avail_spreads |>
+      dplyr::mutate(
+        spread_unit = suppressWarnings(as.integer(spread_unit)),
+        pick_margin = suppressWarnings(as.numeric(pick_margin)),
+        name  = sprintf("SPREAD AVAILABLE — %s vs %s (Wk %s, %s)",
+                        team %||% "NA", opponent %||% "NA",
+                        as.character(week %||% NA), as.character(season %||% NA)),
+        value = sprintf("%s  |  %s  |  edge %s  |  units %s",
+                        spread_pick %||% "NA",
+                        best_book %||% "NA",
+                        plus(pick_margin, 2),
+                        ifelse(is.na(spread_unit), "NA", as.character(spread_unit))),
+        inline = FALSE
+      ) |>
+      dplyr::select(name, value, inline)
+    fields <- c(fields, make_fields(df))
+  }
+  
+  if (!is.null(avail_totals) && nrow(avail_totals)) {
+    df <- avail_totals |>
+      dplyr::mutate(
+        ou_unit        = suppressWarnings(as.integer(ou_unit)),
+        ou_pick_margin = suppressWarnings(as.numeric(ou_pick_margin)),
+        pick_str = dplyr::coalesce(ou_pick_str,
+                                   ifelse(is.na(ou_pick), "(no pick)",
+                                          paste0(stringr::str_to_title(ou_pick), " ?"))),
+        name  = sprintf("TOTAL AVAILABLE — %s vs %s (Wk %s, %s)",
+                        team %||% "NA", opponent %||% "NA",
+                        as.character(week %||% NA), as.character(season %||% NA)),
+        value = sprintf("%s  |  %s  |  edge %s  |  units %s",
+                        pick_str %||% "NA",
+                        best_ou_book %||% "NA",
+                        plus(ou_pick_margin, 2),
+                        ifelse(is.na(ou_unit), "NA", as.character(ou_unit))),
+        inline = FALSE
+      ) |>
+      dplyr::select(name, value, inline)
+    fields <- c(fields, make_fields(df))
+  }
+  
+  if (!is.null(missing_spreads) && nrow(missing_spreads)) {
+    df <- missing_spreads |>
+      dplyr::mutate(
+        name  = sprintf("SPREAD PULLED — %s vs %s (Wk %s, %s)",
+                        team %||% "NA", opponent %||% "NA",
+                        as.character(week %||% NA), as.character(season %||% NA)),
+        value = "Spread line became unavailable (now NA).",
+        inline = FALSE
+      ) |>
+      dplyr::select(name, value, inline)
+    fields <- c(fields, make_fields(df))
+  }
+  
+  if (!is.null(missing_totals) && nrow(missing_totals)) {
+    df <- missing_totals |>
+      dplyr::mutate(
+        name  = sprintf("TOTAL PULLED — %s vs %s (Wk %s, %s)",
+                        team %||% "NA", opponent %||% "NA",
+                        as.character(week %||% NA), as.character(season %||% NA)),
+        value = "Total line became unavailable (now NA).",
+        inline = FALSE
+      ) |>
+      dplyr::select(name, value, inline)
+    fields <- c(fields, make_fields(df))
+  }
+  
+  if (!length(fields)) {
+    sent <- notify_none("No NA/non-NA state changes detected.")
+  } else {
+    # chunk fields into embeds of up to 10 fields
+    batches <- split(fields, ceiling(seq_along(fields) / 10))
+    sent <- 0L
+    for (i in seq_along(batches)) {
+      embed <- list(
+        title = sprintf("Line state changes (%d of %d)", i, length(batches)),
+        description = paste0("Detected NA ↔ non-NA transitions at ", now_utc, " (UTC)."),
+        color = 0x3498db,
+        fields = batches[[i]]
+      )
+      ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
+      if (ok) sent <- sent + length(batches[[i]])
+      Sys.sleep(0.2)
+    }
+  }
+  
+  # --- UPSERT current snapshot into state table (for next run’s diff)
+  stage_name <- DBI::Id(schema = NULL, table = "GamePicksLineState_stage")
   if (DBI::dbExistsTable(con, stage_name)) DBI::dbRemoveTable(con, stage_name)
   DBI::dbWriteTable(
     con, stage_name,
-    new_rows |> dplyr::mutate(first_value = suppressWarnings(as.numeric(line))) |> dplyr::select(id, field, first_value),
+    cur_state |> dplyr::mutate(value = suppressWarnings(as.numeric(value))),
     temporary = TRUE, overwrite = TRUE
   )
   
-  sql_insert_seen <- '
-    INSERT INTO "GamePicksLineSeen" (id, field, first_value, price_spread, price_over, price_under)
-    SELECT id, field, first_value, NULL, NULL, NULL
-    FROM "GamePicksLineSeen_stage"
-    ON CONFLICT (id, field) DO NOTHING;
+  sql_upsert_state <- '
+    INSERT INTO "GamePicksLineState" (id, field, is_available, value)
+    SELECT id, field, is_available, value
+    FROM "GamePicksLineState_stage"
+    ON CONFLICT (id, field) DO UPDATE
+    SET is_available = EXCLUDED.is_available,
+        value        = EXCLUDED.value,
+        updated_at   = now();
   '
   DBI::dbWithTransaction(con, {
-    DBI::dbExecute(con, sql_insert_seen)
+    DBI::dbExecute(con, sql_upsert_state)
     try(DBI::dbRemoveTable(con, stage_name), silent = TRUE)
   })
   
-  invisible(list(notified = sent, inserted = nrow(new_rows)))
+  invisible(list(
+    notified = as.integer(length(fields) > 0),
+    changes  = nrow(changes),
+    upserted = nrow(cur_state)
+  ))
 }
-
 con <- connect_neon()
 
 stopifnot(DBI::dbIsValid(con))

@@ -442,7 +442,7 @@ set.seed(2025)
 
 opt <- bayesOpt(
   FUN = xgb_cv_score, bounds = bounds,
-  initPoints = 10, iters.n = 20,
+  initPoints = 10, iters.n = 100,
   acq = "ei", parallel = FALSE, verbose = 1
 )
 
