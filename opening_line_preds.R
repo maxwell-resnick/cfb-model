@@ -248,37 +248,51 @@ avg3 <- function(a,b,c){
 }
 
 connect_neon <- function() {
-  library(DBI); library(RPostgres); library(httr)
-  
   url <- Sys.getenv("DATABASE_URL", unset = "")
-  if (nzchar(url)) {
-    pu <- httr::parse_url(url)
-    host <- pu$hostname
-    port <- as.integer(pu$port %||% 5432L)
-    db   <- sub("^/", "", pu$path %||% "")
-    user <- utils::URLdecode(pu$username %||% "")
-    pass <- utils::URLdecode(pu$password %||% "")
-    ssl  <- pu$query$sslmode %||% "require"
-  } else {
-    host <- Sys.getenv("PGHOST")
-    port <- as.integer(Sys.getenv("PGPORT", "5432"))
-    db   <- Sys.getenv("PGDATABASE")
-    user <- Sys.getenv("PGUSER")
-    pass <- Sys.getenv("PGPASSWORD")
-    ssl  <- Sys.getenv("PGSSLMODE", "require")
-  }
+  if (!nzchar(url)) stop("DATABASE_URL is not set")
   
-  stopifnot(nzchar(host), nzchar(db), nzchar(user), nzchar(pass))
-  DBI::dbConnect(
+  # Poolers can choke on this param; strip it if present
+  url <- sub("[&?]channel_binding=[^&]+", "", url)
+  
+  u <- httr::parse_url(url)
+  if (is.null(u$hostname)) stop("Malformed DATABASE_URL")
+  
+  dbname <- if (nzchar(u$path)) sub("^/", "", u$path) else ""
+  host   <- u$hostname
+  port   <- if (is.null(u$port)) 5432 else u$port
+  user   <- u$username
+  pass   <- u$password
+  sslm   <- if (!is.null(u$query$sslmode)) u$query$sslmode else "require"
+  
+  # IMPORTANT: no 'options=' here (pooler forbids it)
+  con <- DBI::dbConnect(
     RPostgres::Postgres(),
+    dbname   = dbname,
     host     = host,
     port     = port,
-    dbname   = db,
     user     = user,
     password = pass,
-    sslmode  = ssl
+    sslmode  = sslm
   )
+  
+  # Optional: set search_path at session level (allowed; ignore if restricted)
+  try(DBI::dbExecute(con, 'SET search_path TO public'), silent = TRUE)
+  
+  # Smoke test
+  DBI::dbGetQuery(con, "SELECT 1 AS ok;")
+  con
 }
+
+Sys.setenv(
+  DATABASE_URL = sprintf(
+    "postgresql://%s:%s@%s:%d/%s?sslmode=require",
+    "neondb_owner",
+    utils::URLencode("npg_POip9LKGFAa6", reserved = TRUE),  # URL-encode just in case
+    "ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech",
+    5432,
+    "neondb"
+  )
+)
 
 con <- connect_neon()
 
@@ -1147,404 +1161,139 @@ if (!nzchar(GAME_PICK_WEBHOOK)) {
   GAME_PICK_WEBHOOK <- "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
 }
 
-# ------------------------------------------------------------------
-# 1) Discord sender with rate-limit handling (429) + retries
-# ------------------------------------------------------------------
-send_discord <- function(webhook, content = NULL, embeds = NULL,
-                         username = "OpeningLine Bot", max_retries = 5L) {
-  if (is.na(webhook) || !nzchar(webhook)) return(FALSE)
-  payload <- list(username = username)
-  if (!is.null(content)) payload$content <- content
-  if (!is.null(embeds))  payload$embeds  <- embeds
-  
-  attempt <- 1L
-  repeat {
-    resp <- try(
-      httr::POST(webhook,
-                 httr::add_headers(`Content-Type` = "application/json"),
-                 body = jsonlite::toJSON(payload, auto_unbox = TRUE)),
-      silent = TRUE
-    )
-    if (inherits(resp, "try-error")) return(FALSE)
+if (!exists("send_discord", mode = "function")) {
+  send_discord <- function(webhook, content = NULL, embeds = NULL,
+                           username = "OpeningLine Bot", max_retries = 5L) {
+    if (is.na(webhook) || !nzchar(webhook)) return(FALSE)
+    payload <- list(username = username)
+    if (!is.null(content)) payload$content <- content
+    if (!is.null(embeds))  payload$embeds  <- embeds
     
-    sc <- httr::status_code(resp)
-    if (sc == 204 || sc == 200) return(TRUE)
-    
-    if (sc == 429) {
-      body_txt <- httr::content(resp, as = "text", encoding = "UTF-8")
-      retry_after <- tryCatch({
-        x <- jsonlite::fromJSON(body_txt)
-        as.numeric(x$retry_after)
-      }, error = function(e) 1)
-      Sys.sleep(max(1, retry_after))
-      attempt <- attempt + 1L
+    attempt <- 1L
+    repeat {
+      resp <- try(
+        httr::POST(webhook,
+                   httr::add_headers(`Content-Type` = "application/json"),
+                   body = jsonlite::toJSON(payload, auto_unbox = TRUE)),
+        silent = TRUE
+      )
+      if (inherits(resp, "try-error")) return(FALSE)
+      sc <- httr::status_code(resp)
+      if (sc == 204 || sc == 200) return(TRUE)
+      if (sc == 429) {
+        body_txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+        retry_after <- tryCatch({
+          x <- jsonlite::fromJSON(body_txt); as.numeric(x$retry_after)
+        }, error = function(e) 1)
+        Sys.sleep(max(1, retry_after)); attempt <- attempt + 1L
+        if (attempt > max_retries) return(FALSE)
+        next
+      }
+      Sys.sleep(0.5); attempt <- attempt + 1L
       if (attempt > max_retries) return(FALSE)
-      next
-    }
-    
-    Sys.sleep(0.5)
-    attempt <- attempt + 1L
-    if (attempt > max_retries) return(FALSE)
-  }
-}
-
-ensure_line_state_table <- function(con) {
-  DBI::dbExecute(con, '
-    CREATE TABLE IF NOT EXISTS "GamePicksLineState" (
-      id BIGINT NOT NULL,
-      field TEXT NOT NULL,
-      is_available BOOLEAN NOT NULL,
-      value DOUBLE PRECISION,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (id, field)
-    );
-  ')
-}
-
-# ------------------------------------------------------------------
-# Helpers for Discord fields (strictly valid embeds)
-# ------------------------------------------------------------------
-sanitize_str <- function(x, max_nchar) {
-  x <- ifelse(is.na(x) | !nzchar(x), "NA", as.character(x))
-  ifelse(nchar(x, type = "width") > max_nchar, substr(x, 1, max_nchar), x)
-}
-make_fields <- function(df) {
-  n <- nrow(df); out <- vector("list", n)
-  for (i in seq_len(n)) {
-    nm  <- sanitize_str(df$name[i], 256)
-    val <- sanitize_str(df$value[i], 1024)
-    inl <- if ("inline" %in% names(df)) isTRUE(df$inline[i]) else FALSE
-    out[[i]] <- list(name = nm, value = val, inline = inl)
-  }
-  out
-}
-plus <- function(x, dig = 2) {
-  x <- suppressWarnings(as.numeric(x))
-  ifelse(is.na(x), "NA",
-         ifelse(x >= 0, paste0("+", format(round(x, dig), nsmall = dig)),
-                format(round(x, dig), nsmall = dig)))
-}
-
-ensure_lines_seen_table <- function(con) {
-  DBI::dbExecute(con, '
-    CREATE TABLE IF NOT EXISTS "GamePicksLineSeen" (
-      id BIGINT NOT NULL,
-      field TEXT NOT NULL,
-      first_value DOUBLE PRECISION,
-      price_spread DOUBLE PRECISION,
-      price_over DOUBLE PRECISION,
-      price_under DOUBLE PRECISION,
-      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (id, field)
-    );
-  ')
-}
-
-
-# ------------------------------------------------------------------
-# 3) NA -> non-NA detector and Discord notifier
-# ------------------------------------------------------------------
-post_new_line_picks_to_discord <- function(con, webhook = GAME_PICK_WEBHOOK, notify_when_none = TRUE) {
-  stopifnot(DBI::dbIsValid(con))
-  ensure_lines_seen_table(con)   # keeps your original audit ("first seen") if you still want it
-  ensure_line_state_table(con)   # NEW: maintains current state for each id/field
-  
-  # fallback for `%||%`
-  if (!exists("%||%", mode = "function")) {
-    `%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || (is.atomic(x) && all(is.na(x)))) y else x
-  }
-  if (!exists("send_discord", mode = "function")) stop("send_discord() is not defined in this session.")
-  
-  now_utc <- format(as.POSIXct(Sys.time(), tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ")
-  
-  notify_none <- function(reason = "(unspecified)") {
-    if (!notify_when_none) return(invisible(FALSE))
-    if (!nzchar(webhook))  return(invisible(FALSE))
-    embed <- list(
-      title = "No line state changes",
-      description = paste0("As of ", now_utc, " (UTC): ", reason),
-      color = 0x95A5A6
-    )
-    isTRUE(send_discord(webhook, embeds = list(embed)))
-  }
-  
-  gp_cols <- DBI::dbGetQuery(
-    con,
-    "SELECT column_name FROM information_schema.columns
-     WHERE table_schema='public' AND table_name='GamePicks'"
-  )$column_name
-  
-  line_cols_all <- c(
-    "dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread",
-    "dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder"
-  )
-  line_cols <- intersect(line_cols_all, gp_cols)
-  if (!length(line_cols)) {
-    sent <- notify_none("No watched line columns present in GamePicks.")
-    return(invisible(list(notified = as.integer(sent), changes = 0L, upserted = 0L)))
-  }
-  
-  pick_cols_all <- c(
-    "spread_pick","best_book","pick_margin","spread_unit",
-    "ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit",
-    "season","week","team","opponent","startDate",
-    "actual_total"
-  )
-  
-  pick_cols <- intersect(pick_cols_all, gp_cols)
-  
-  sel_cols <- unique(c("id", line_cols, pick_cols))
-  q_cols   <- paste(sprintf('"%s"', sel_cols), collapse = ", ")
-  gp <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "GamePicks";', q_cols))
-  
-  # -------- filter: eligible IDs for notification only --------
-  eligible_ids <- gp %>%
-    dplyr::mutate(
-      team     = as.character(team),
-      opponent = as.character(opponent)
-    ) %>%
-    { if ("actual_total" %in% names(.)) dplyr::filter(., is.na(actual_total)) else . } %>%
-    dplyr::filter(
-      # keep rows where neither team nor opponent contains "Test "
-      !stringr::str_detect(dplyr::coalesce(team, ""), stringr::fixed("Test ")) &
-        !stringr::str_detect(dplyr::coalesce(opponent, ""), stringr::fixed("Test "))
-    ) %>%
-    dplyr::pull(id) %>%
-    unique()
-  
-  # --- Current snapshot (unfiltered; we still track full state) ---
-  cur_state <- gp |>
-    tidyr::pivot_longer(
-      cols = tidyselect::all_of(line_cols),
-      names_to = "field",
-      values_to = "line_raw"
-    ) |>
-    dplyr::transmute(
-      id,
-      field,
-      is_available = !is.na(line_raw),
-      value = suppressWarnings(as.numeric(line_raw))
-    )
-  
-  if (!nrow(cur_state)) {
-    sent <- notify_none("No rows returned from GamePicks.")
-    return(invisible(list(notified = as.integer(sent), changes = 0L, upserted = 0L)))
-  }
-  
-  # --- Previous snapshot from state table
-  prev_state <- DBI::dbGetQuery(
-    con,
-    'SELECT id, field, is_available AS prev_available, value AS prev_value FROM "GamePicksLineState";'
-  )
-  
-  # --- Compute transitions, then restrict to eligible IDs for notifications ---
-  changes <- cur_state |>
-    dplyr::left_join(prev_state, by = c("id","field")) |>
-    dplyr::mutate(
-      transition = dplyr::case_when(
-        (is.na(prev_available) | prev_available == FALSE) & (is_available == TRUE)  ~ "became_available",
-        (prev_available == TRUE)                          & (is_available == FALSE) ~ "became_missing",
-        TRUE ~ NA_character_
-      )
-    ) |>
-    dplyr::filter(!is.na(transition)) |>
-    dplyr::filter(id %in% eligible_ids)
-  
-  # --- Build Discord embeds for both directions (only eligible IDs) ---
-  enrich <- function(ids) {
-    if (!length(ids)) return(NULL)
-    cols_needed <- intersect(c(
-      "id","season","week","team","opponent",
-      "spread_pick","best_book","pick_margin","spread_unit",
-      "ou_pick","ou_pick_str","best_ou_book","ou_pick_margin","ou_unit"
-    ), names(gp))
-    if (!length(cols_needed)) return(NULL)
-    gp |>
-      dplyr::filter(id %in% ids) |>
-      dplyr::select(dplyr::all_of(cols_needed))
-  }
-  
-  became_avail   <- changes |> dplyr::filter(transition == "became_available")
-  became_missing <- changes |> dplyr::filter(transition == "became_missing")
-  
-  avail_spreads <- became_avail   |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique() |> enrich()
-  avail_totals  <- became_avail   |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique() |> enrich()
-  missing_spreads <- became_missing |> dplyr::filter(grepl("spread", field))    |> dplyr::pull(id) |> unique() |> enrich()
-  missing_totals  <- became_missing |> dplyr::filter(grepl("overunder", field)) |> dplyr::pull(id) |> unique() |> enrich()
-  
-  fields <- list()
-  
-  if (!is.null(avail_spreads) && nrow(avail_spreads)) {
-    df <- avail_spreads |>
-      dplyr::mutate(
-        spread_unit = suppressWarnings(as.integer(spread_unit)),
-        pick_margin = suppressWarnings(as.numeric(pick_margin)),
-        name  = sprintf("SPREAD AVAILABLE — %s vs %s (Wk %s, %s)",
-                        team %||% "NA", opponent %||% "NA",
-                        as.character(week %||% NA), as.character(season %||% NA)),
-        value = sprintf("%s  |  %s  |  edge %s  |  units %s",
-                        spread_pick %||% "NA",
-                        best_book %||% "NA",
-                        plus(pick_margin, 2),
-                        ifelse(is.na(spread_unit), "NA", as.character(spread_unit))),
-        inline = FALSE
-      ) |>
-      dplyr::select(name, value, inline)
-    fields <- c(fields, make_fields(df))
-  }
-  
-  if (!is.null(avail_totals) && nrow(avail_totals)) {
-    df <- avail_totals |>
-      dplyr::mutate(
-        ou_unit        = suppressWarnings(as.integer(ou_unit)),
-        ou_pick_margin = suppressWarnings(as.numeric(ou_pick_margin)),
-        pick_str = dplyr::coalesce(ou_pick_str,
-                                   ifelse(is.na(ou_pick), "(no pick)",
-                                          paste0(stringr::str_to_title(ou_pick), " ?"))),
-        name  = sprintf("TOTAL AVAILABLE — %s vs %s (Wk %s, %s)",
-                        team %||% "NA", opponent %||% "NA",
-                        as.character(week %||% NA), as.character(season %||% NA)),
-        value = sprintf("%s  |  %s  |  edge %s  |  units %s",
-                        pick_str %||% "NA",
-                        best_ou_book %||% "NA",
-                        plus(ou_pick_margin, 2),
-                        ifelse(is.na(ou_unit), "NA", as.character(ou_unit))),
-        inline = FALSE
-      ) |>
-      dplyr::select(name, value, inline)
-    fields <- c(fields, make_fields(df))
-  }
-  
-  if (!is.null(missing_spreads) && nrow(missing_spreads)) {
-    df <- missing_spreads |>
-      dplyr::mutate(
-        name  = sprintf("SPREAD PULLED — %s vs %s (Wk %s, %s)",
-                        team %||% "NA", opponent %||% "NA",
-                        as.character(week %||% NA), as.character(season %||% NA)),
-        value = "Spread line became unavailable (now NA).",
-        inline = FALSE
-      ) |>
-      dplyr::select(name, value, inline)
-    fields <- c(fields, make_fields(df))
-  }
-  
-  if (!is.null(missing_totals) && nrow(missing_totals)) {
-    df <- missing_totals |>
-      dplyr::mutate(
-        name  = sprintf("TOTAL PULLED — %s vs %s (Wk %s, %s)",
-                        team %||% "NA", opponent %||% "NA",
-                        as.character(week %||% NA), as.character(season %||% NA)),
-        value = "Total line became unavailable (now NA).",
-        inline = FALSE
-      ) |>
-      dplyr::select(name, value, inline)
-    fields <- c(fields, make_fields(df))
-  }
-  
-  if (!length(fields)) {
-    sent <- notify_none("No NA/non-NA state changes detected.")
-  } else {
-    # chunk fields into embeds of up to 10 fields
-    batches <- split(fields, ceiling(seq_along(fields) / 10))
-    sent <- 0L
-    for (i in seq_along(batches)) {
-      embed <- list(
-        title = sprintf("Line state changes (%d of %d)", i, length(batches)),
-        description = paste0("Detected NA ↔ non-NA transitions at ", now_utc, " (UTC)."),
-        color = 0x3498db,
-        fields = batches[[i]]
-      )
-      ok <- isTRUE(send_discord(webhook, embeds = list(embed)))
-      if (ok) sent <- sent + length(batches[[i]])
-      Sys.sleep(0.2)
     }
   }
-  
-  # --- UPSERT current snapshot into state table (for next run’s diff)
-  stage_name <- DBI::Id(schema = NULL, table = "GamePicksLineState_stage")
-  if (DBI::dbExistsTable(con, stage_name)) DBI::dbRemoveTable(con, stage_name)
-  DBI::dbWriteTable(
-    con, stage_name,
-    cur_state |> dplyr::mutate(value = suppressWarnings(as.numeric(value))),
-    temporary = TRUE, overwrite = TRUE
-  )
-  
-  sql_upsert_state <- '
-    INSERT INTO "GamePicksLineState" (id, field, is_available, value)
-    SELECT id, field, is_available, value
-    FROM "GamePicksLineState_stage"
-    ON CONFLICT (id, field) DO UPDATE
-    SET is_available = EXCLUDED.is_available,
-        value        = EXCLUDED.value,
-        updated_at   = now();
-  '
-  DBI::dbWithTransaction(con, {
-    DBI::dbExecute(con, sql_upsert_state)
-    try(DBI::dbRemoveTable(con, stage_name), silent = TRUE)
-  })
-  
-  invisible(list(
-    notified = as.integer(length(fields) > 0),
-    changes  = nrow(changes),
-    upserted = nrow(cur_state)
-  ))
-}
-suppressPackageStartupMessages(library(RPostgres))
-
-Sys.setenv(
-  DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
-)
-
-connect_neon <- function() {
-  url <- Sys.getenv("DATABASE_URL", unset = "")
-  if (!nzchar(url)) stop("DATABASE_URL is not set")
-  
-  # Poolers can choke on this param; strip it if present
-  url <- sub("[&?]channel_binding=[^&]+", "", url)
-  
-  u <- httr::parse_url(url)
-  if (is.null(u$hostname)) stop("Malformed DATABASE_URL")
-  
-  dbname <- if (nzchar(u$path)) sub("^/", "", u$path) else ""
-  host   <- u$hostname
-  port   <- if (is.null(u$port)) 5432 else u$port
-  user   <- u$username
-  pass   <- u$password
-  sslm   <- if (!is.null(u$query$sslmode)) u$query$sslmode else "require"
-  
-  # IMPORTANT: no 'options=' here (pooler forbids it)
-  con <- DBI::dbConnect(
-    RPostgres::Postgres(),
-    dbname   = dbname,
-    host     = host,
-    port     = port,
-    user     = user,
-    password = pass,
-    sslmode  = sslm
-  )
-  
-  # Optional: set search_path at session level (allowed; ignore if restricted)
-  try(DBI::dbExecute(con, 'SET search_path TO public'), silent = TRUE)
-  
-  # Smoke test
-  DBI::dbGetQuery(con, "SELECT 1 AS ok;")
-  con
 }
 
-Sys.setenv(
-  DATABASE_URL = "postgresql://neondb_owner:npg_POip9LKGFAa6@ep-tiny-fog-aetzb4mp-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
-)
-con <- connect_neon()  # uses the function you already defined
+# --- helper: send a data.frame as one or more code-block messages (auto-chunk) ---
+send_df_as_code_blocks <- function(webhook, df, title = NULL, max_chars = 1900) {
+  if (nrow(df) == 0) return(invisible(FALSE))
+  # small formatting pass for nicer width & concise numerics
+  df_fmt <- df %>%
+    mutate(across(where(is.double), ~ round(., 3)))
+  
+  lines <- capture.output(print(df_fmt, row.names = FALSE, right = TRUE))
+  header <- if (!is.null(title) && nzchar(title)) paste0("**", title, "**\n") else ""
+  block_wrap <- function(s) paste0(header, "```", s, "```")
+  
+  chunks <- list()
+  cur <- character(0); cur_n <- 0
+  for (ln in lines) {
+    # +1 for newline; reserve a bit for the code fences & optional header
+    add_n <- nchar(ln) + 1
+    if ((cur_n + add_n) > max_chars && length(cur) > 0) {
+      chunks[[length(chunks) + 1]] <- paste(cur, collapse = "\n")
+      cur <- character(0); cur_n <- 0
+    }
+    cur <- c(cur, ln); cur_n <- cur_n + add_n
+  }
+  if (length(cur)) chunks[[length(chunks) + 1]] <- paste(cur, collapse = "\n")
+  
+  sent_any <- FALSE
+  for (i in seq_along(chunks)) {
+    msg_title <- if (length(chunks) > 1) paste0(title, sprintf(" (part %d/%d)", i, length(chunks))) else title
+    content <- block_wrap(chunks[[i]])
+    ok <- isTRUE(send_discord(webhook, content = content))
+    sent_any <- sent_any || ok
+    Sys.sleep(0.2)
+  }
+  invisible(sent_any)
+}
 
+# --- main poster: builds window & sends spreads + totals ---
+post_window_picks_to_discord <- function(final_2025_out,
+                                         webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
+                                         days_min = 3L, days_max = 10L,
+                                         tz = "UTC") {
+  if (!nzchar(webhook)) return(invisible(FALSE))
+  
+  now_utc <- lubridate::now(tzone = tz)
+  min_dt  <- now_utc + days(days_min)
+  max_dt  <- now_utc + days(days_max)
+  
+  df <- final_2025_out %>%
+    mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01"))
+  
+  # Spreads
+  spreads <- df %>%
+    filter(startDate >= min_dt, startDate <= max_dt,
+           !is.na(best_book), spread_unit >= 1) %>%
+    select(team, opponent, best_book, spread_pick, spread_hit_probability, spread_unit) %>%
+    arrange(desc(spread_unit))
+  
+  # Totals
+  totals <- df %>%
+    filter(startDate >= min_dt, startDate <= max_dt,
+           !is.na(best_ou_book), ou_unit >= 1) %>%
+    select(team, opponent, best_ou_book, ou_pick_str, ou_hit_probability, ou_unit) %>%
+    arrange(desc(ou_unit))
+  
+  window_str <- paste0(
+    format(min_dt, "%Y-%m-%d %H:%M", tz = tz), " → ",
+    format(max_dt, "%Y-%m-%d %H:%M", tz = tz), " (", tz, ")"
+  )
+  
+  sent1 <- FALSE; sent2 <- FALSE
+  if (nrow(spreads)) {
+    sent1 <- send_df_as_code_blocks(
+      webhook,
+      spreads,
+      title = paste0("Spread picks (units ≥ 1) — window: ", window_str)
+    )
+  }
+  if (nrow(totals)) {
+    sent2 <- send_df_as_code_blocks(
+      webhook,
+      totals,
+      title = paste0("Totals picks (units ≥ 1) — window: ", window_str)
+    )
+  }
+  
+  # Optional: if neither had rows, post a small note (comment out if you prefer silence)
+  if (!sent1 && !sent2) {
+    msg <- paste0(
+      "**No qualifying picks** in window ", window_str,
+      " (spreads: units ≥ 1 & book present; totals: units ≥ 1 & book present)."
+    )
+    isTRUE(send_discord(webhook, content = msg))
+  }
+  
+  invisible(list(spreads = nrow(spreads), totals = nrow(totals)))
+}
 
-stopifnot(DBI::dbIsValid(con))
-res <- post_new_line_picks_to_discord(con, webhook = GAME_PICK_WEBHOOK)
-print(res)
+con <- connect_neon()
 
-
-
-
-
+post_window_picks_to_discord(final_2025_out, webhook = GAME_PICK_WEBHOOK)
 
 
 # suppressPackageStartupMessages({
