@@ -1263,17 +1263,17 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01")) %>%
     filter(startDate >= min_dt, startDate <= max_dt)
   
-  # Spread picks
+  # Spread picks, descending by spread_hit_probability
   spreads <- df %>%
     filter(!is.na(best_book), spread_unit >= 1) %>%
     select(team, opponent, best_book, spread_pick, spread_hit_probability, spread_unit) %>%
-    arrange(desc(spread_unit))
+    arrange(desc(spread_hit_probability))
   
-  # Totals picks
+  # Totals picks, descending by ou_hit_probability
   totals <- df %>%
     filter(!is.na(best_ou_book), ou_unit >= 1) %>%
     select(team, opponent, best_ou_book, ou_pick_str, ou_hit_probability, ou_unit) %>%
-    arrange(desc(ou_unit))
+    arrange(desc(ou_hit_probability))
   
   window_str <- paste0(
     format(min_dt, "%Y-%m-%d %H:%M", tz = tz), " → ",
