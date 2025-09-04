@@ -629,9 +629,59 @@ avg_row <- function(...) {
   ifelse(is.nan(x), NA_real_, x)
 }
 
+# --- helper used below (safe row average) ---
+if (!exists("avg_row", mode = "function")) {
+  avg_row <- function(...) {
+    x <- rowMeans(cbind(...), na.rm = TRUE)
+    ifelse(is.nan(x), NA_real_, x)
+  }
+}
+
+# --- choose columns that might carry opening/current OU info ---
+ou_open_cols <- intersect(
+  c(
+    "bovada_formatted_opening_overunder",
+    "espnbet_formatted_opening_overunder",  # keep/remove as you wish
+    # use current books as fallback signal for opening OU level
+    "dk_formatted_overunder",
+    "fd_formatted_overunder",
+    "mgm_formatted_overunder"
+  ),
+  names(spread_scores_keys_2025)
+)
+
+ou_curr_cols <- intersect(
+  c(
+    "dk_formatted_overunder",
+    "fd_formatted_overunder",
+    "mgm_formatted_overunder",
+    "bovada_formatted_overunder",
+    "espnbet_formatted_overunder"
+  ),
+  names(spread_scores_keys_2025)
+)
+
+# --- compute GLOBAL averages once (numeric, ignoring non-finite) ---
+global_open_ou_avg <- {
+  vals <- unlist(lapply(ou_open_cols, function(nm)
+    suppressWarnings(as.numeric(spread_scores_keys_2025[[nm]]))
+  ), use.names = FALSE)
+  vals <- vals[is.finite(vals)]
+  if (length(vals)) mean(vals) else NA_real_
+}
+
+global_curr_ou_avg <- {
+  vals <- unlist(lapply(ou_curr_cols, function(nm)
+    suppressWarnings(as.numeric(spread_scores_keys_2025[[nm]]))
+  ), use.names = FALSE)
+  vals <- vals[is.finite(vals)]
+  if (length(vals)) mean(vals) else NA_real_
+}
+
+# --- build formatted_* and then IMPUTE with the GLOBAL avg(s) ---
 spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
   mutate(
-    # OPENING lines: only from DB books (Bovada / ESPN Bet)
+    # OPENING lines (your existing construction)
     formatted_opening_spread = avg_row(
       bovada_formatted_opening_spread,
       espnbet_formatted_opening_spread,
@@ -647,7 +697,14 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
       mgm_formatted_overunder
     ),
     
-    # CURRENT lines: prefer OddsAPI books (DK/FD/MGM), but also allow DB books if present
+    # >>> GLOBAL IMPUTE: only when spread exists but opening OU is missing
+    formatted_opening_overunder = if_else(
+      is.na(formatted_opening_overunder) & !is.na(formatted_opening_spread),
+      global_open_ou_avg,
+      formatted_opening_overunder
+    ),
+    
+    # CURRENT lines (your existing construction)
     formatted_spread = avg_row(
       dk_formatted_spread,
       fd_formatted_spread,
@@ -663,10 +720,18 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
       espnbet_formatted_overunder
     ),
     
-    # Implied team totals (same formulas you had)
+    # (Optional) GLOBAL IMPUTE for current OU too — comment out if not desired
+    formatted_overunder = if_else(
+      is.na(formatted_overunder),
+      global_curr_ou_avg,
+      formatted_overunder
+    ),
+    
+    # Team-point calcs (keep your sign convention)
     vegas_opening_team_points = (formatted_opening_overunder + formatted_opening_spread) / 2,
     vegas_team_points         = (formatted_overunder         + formatted_spread)         / 2
   )
+
 
 con <- connect_neon()
 
@@ -821,7 +886,8 @@ if (length(missing_feats)) combined_2025[missing_feats] <- NA_real_
 
 # ---- Predictions for team points (already have final_xgb_fit, features_used, combined_2025) ----
 pred_2025 <- combined_2025 %>%
-  mutate(across(all_of(features_used), as.numeric))
+  mutate(across(all_of(features_used), as.numeric),
+         vegas_opening_team_points = vegas_team_points)
 
 X_2025 <- as.matrix(pred_2025[, features_used, drop = FALSE])
 d2025  <- xgboost::xgb.DMatrix(X_2025, missing = NA)
