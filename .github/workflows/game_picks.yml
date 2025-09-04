@@ -49,6 +49,7 @@ jobs:
             any::TMB
             any::stringr
             any::purrr
+            any::gt
 
       - name: Install oddsapiR (R-Universe)
         run: |
