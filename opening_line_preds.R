@@ -1209,14 +1209,10 @@ final_2025_out <- picks_2025 %>%
 
 
 suppressPackageStartupMessages({
-  library(DBI)
   library(dplyr)
-  library(tidyr)
-  library(stringr)
-  library(glue)
-  library(jsonlite)
-  library(httr)
   library(lubridate)
+  library(gt)
+  library(webshot2) # gtsave backend
 })
 
 # ------------------------------------------------------------------
@@ -1227,80 +1223,36 @@ if (!nzchar(GAME_PICK_WEBHOOK)) {
   GAME_PICK_WEBHOOK <- "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
 }
 
-if (!exists("send_discord", mode = "function")) {
-  send_discord <- function(webhook, content = NULL, embeds = NULL,
-                           username = "OpeningLine Bot", max_retries = 5L) {
-    if (is.na(webhook) || !nzchar(webhook)) return(FALSE)
-    payload <- list(username = username)
-    if (!is.null(content)) payload$content <- content
-    if (!is.null(embeds))  payload$embeds  <- embeds
-    
-    attempt <- 1L
-    repeat {
-      resp <- try(
-        httr::POST(webhook,
-                   httr::add_headers(`Content-Type` = "application/json"),
-                   body = jsonlite::toJSON(payload, auto_unbox = TRUE)),
-        silent = TRUE
-      )
-      if (inherits(resp, "try-error")) return(FALSE)
-      sc <- httr::status_code(resp)
-      if (sc == 204 || sc == 200) return(TRUE)
-      if (sc == 429) {
-        body_txt <- httr::content(resp, as = "text", encoding = "UTF-8")
-        retry_after <- tryCatch({
-          x <- jsonlite::fromJSON(body_txt); as.numeric(x$retry_after)
-        }, error = function(e) 1)
-        Sys.sleep(max(1, retry_after)); attempt <- attempt + 1L
-        if (attempt > max_retries) return(FALSE)
-        next
-      }
-      Sys.sleep(0.5); attempt <- attempt + 1L
-      if (attempt > max_retries) return(FALSE)
-    }
-  }
+send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png") {
+  if (nrow(df) == 0) return(FALSE)
+  
+  tbl_gt <- df %>%
+    gt() %>%
+    tab_header(title = title) %>%
+    opt_all_caps(FALSE) %>%
+    fmt_number(
+      columns = everything(),
+      decimals = 3
+    )
+  
+  # save as PNG
+  gtsave(tbl_gt, file_path, expand = 10) # expand ensures no clipping
+  
+  # send to Discord as file
+  payload <- httr::POST(
+    url = webhook,
+    httr::add_headers(`Content-Type` = "multipart/form-data"),
+    body = list(file = httr::upload_file(file_path))
+  )
+  
+  sc <- httr::status_code(payload)
+  isTRUE(sc %in% c(200, 204))
 }
 
-# --- helper: send a data.frame as one or more code-block messages (auto-chunk) ---
-send_df_as_code_blocks <- function(webhook, df, title = NULL, max_chars = 1900) {
-  if (nrow(df) == 0) return(invisible(FALSE))
-  # small formatting pass for nicer width & concise numerics
-  df_fmt <- df %>%
-    mutate(across(where(is.double), ~ round(., 3)))
-  
-  lines <- capture.output(print(df_fmt, row.names = FALSE, right = TRUE))
-  header <- if (!is.null(title) && nzchar(title)) paste0("**", title, "**\n") else ""
-  block_wrap <- function(s) paste0(header, "```", s, "```")
-  
-  chunks <- list()
-  cur <- character(0); cur_n <- 0
-  for (ln in lines) {
-    # +1 for newline; reserve a bit for the code fences & optional header
-    add_n <- nchar(ln) + 1
-    if ((cur_n + add_n) > max_chars && length(cur) > 0) {
-      chunks[[length(chunks) + 1]] <- paste(cur, collapse = "\n")
-      cur <- character(0); cur_n <- 0
-    }
-    cur <- c(cur, ln); cur_n <- cur_n + add_n
-  }
-  if (length(cur)) chunks[[length(chunks) + 1]] <- paste(cur, collapse = "\n")
-  
-  sent_any <- FALSE
-  for (i in seq_along(chunks)) {
-    msg_title <- if (length(chunks) > 1) paste0(title, sprintf(" (part %d/%d)", i, length(chunks))) else title
-    content <- block_wrap(chunks[[i]])
-    ok <- isTRUE(send_discord(webhook, content = content))
-    sent_any <- sent_any || ok
-    Sys.sleep(0.2)
-  }
-  invisible(sent_any)
-}
-
-# --- main poster: builds window & sends spreads + totals ---
-post_window_picks_to_discord <- function(final_2025_out,
-                                         webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
-                                         days_min = 3L, days_max = 10L,
-                                         tz = "UTC") {
+post_window_picks_to_discord_png <- function(final_2025_out,
+                                             webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
+                                             days_min = 3L, days_max = 10L,
+                                             tz = "UTC") {
   if (!nzchar(webhook)) return(invisible(FALSE))
   
   now_utc <- lubridate::now(tzone = tz)
@@ -1308,19 +1260,18 @@ post_window_picks_to_discord <- function(final_2025_out,
   max_dt  <- now_utc + days(days_max)
   
   df <- final_2025_out %>%
-    mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01"))
+    mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01")) %>%
+    filter(startDate >= min_dt, startDate <= max_dt)
   
-  # Spreads
+  # Spread picks
   spreads <- df %>%
-    filter(startDate >= min_dt, startDate <= max_dt,
-           !is.na(best_book), spread_unit >= 1) %>%
+    filter(!is.na(best_book), spread_unit >= 1) %>%
     select(team, opponent, best_book, spread_pick, spread_hit_probability, spread_unit) %>%
     arrange(desc(spread_unit))
   
-  # Totals
+  # Totals picks
   totals <- df %>%
-    filter(startDate >= min_dt, startDate <= max_dt,
-           !is.na(best_ou_book), ou_unit >= 1) %>%
+    filter(!is.na(best_ou_book), ou_unit >= 1) %>%
     select(team, opponent, best_ou_book, ou_pick_str, ou_hit_probability, ou_unit) %>%
     arrange(desc(ou_unit))
   
@@ -1329,23 +1280,25 @@ post_window_picks_to_discord <- function(final_2025_out,
     format(max_dt, "%Y-%m-%d %H:%M", tz = tz), " (", tz, ")"
   )
   
-  sent1 <- FALSE; sent2 <- FALSE
+  sent1 <- sent2 <- FALSE
   if (nrow(spreads)) {
-    sent1 <- send_df_as_code_blocks(
+    sent1 <- send_df_as_png(
       webhook,
       spreads,
-      title = paste0("Spread picks (units ≥ 1) — window: ", window_str)
+      title = paste0("Spread picks (units ≥ 1) — window: ", window_str),
+      file_path = "spreads_table.png"
     )
   }
   if (nrow(totals)) {
-    sent2 <- send_df_as_code_blocks(
+    sent2 <- send_df_as_png(
       webhook,
       totals,
-      title = paste0("Totals picks (units ≥ 1) — window: ", window_str)
+      title = paste0("Totals picks (units ≥ 1) — window: ", window_str),
+      file_path = "totals_table.png"
     )
   }
   
-  # Optional: if neither had rows, post a small note (comment out if you prefer silence)
+  # fallback message if nothing qualifies
   if (!sent1 && !sent2) {
     msg <- paste0(
       "**No qualifying picks** in window ", window_str,
@@ -1357,9 +1310,7 @@ post_window_picks_to_discord <- function(final_2025_out,
   invisible(list(spreads = nrow(spreads), totals = nrow(totals)))
 }
 
-con <- connect_neon()
-
-post_window_picks_to_discord(final_2025_out, webhook = GAME_PICK_WEBHOOK)
+post_window_picks_to_discord_png(final_2025_out, webhook = GAME_PICK_WEBHOOK)
 
 
 # suppressPackageStartupMessages({
