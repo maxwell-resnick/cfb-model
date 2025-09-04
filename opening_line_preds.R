@@ -1251,7 +1251,7 @@ send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png
 
 post_window_picks_to_discord_png <- function(final_2025_out,
                                              webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
-                                             days_min = 3L, days_max = 10L,
+                                             days_min = 3L, days_max = 14L,
                                              tz = "UTC") {
   if (!nzchar(webhook)) return(invisible(FALSE))
   
