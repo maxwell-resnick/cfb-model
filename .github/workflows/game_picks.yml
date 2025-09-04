@@ -50,6 +50,7 @@ jobs:
             any::stringr
             any::purrr
             any::gt
+            any::webshot2
 
       - name: Install oddsapiR (R-Universe)
         run: |
