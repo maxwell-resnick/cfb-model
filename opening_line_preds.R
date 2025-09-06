@@ -1298,20 +1298,19 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     )
   }
   
-  # fallback message if nothing qualifies
-  if (!sent1 && !sent2) {
-    msg <- paste0(
-      "**No qualifying picks** in window ", window_str,
-      " (spreads: units ≥ 1 & book present; totals: units ≥ 1 & book present)."
-    )
-    isTRUE(send_discord(webhook, content = msg))
-  }
+  # # fallback message if nothing qualifies
+  # if (!sent1 && !sent2) {
+  #   msg <- paste0(
+  #     "**No qualifying picks** in window ", window_str,
+  #     " (spreads: units ≥ 1 & book present; totals: units ≥ 1 & book present)."
+  #   )
+  #   isTRUE(send_discord(webhook, content = msg))
+  # }
   
   invisible(list(spreads = nrow(spreads), totals = nrow(totals)))
 }
 
 post_window_picks_to_discord_png(final_2025_out, webhook = GAME_PICK_WEBHOOK)
-
 
 # suppressPackageStartupMessages({
 #   library(DBI)
