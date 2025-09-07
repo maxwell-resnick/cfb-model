@@ -1325,9 +1325,10 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(lubridate)
   library(gt)
-  library(webshot2)  # preferred renderer (Chrome/Chromium via chromote)
+  library(webshot2)
   library(httr)
   library(glue)
+  library(tidyr)
 })
 
 # ------------------------------------------------------------------
@@ -1360,9 +1361,7 @@ ensure_headless_chrome <- function() {
   }
   ok <- FALSE
   try({
-    b <- chromote::Chromote$new()
-    b$close()
-    ok <- TRUE
+    b <- chromote::Chromote$new(); b$close(); ok <- TRUE
   }, silent = TRUE)
   ok
 }
@@ -1374,9 +1373,7 @@ post_file_with_retry <- function(webhook, file_path, content = NULL, retries = 4
   stopifnot(nchar(webhook) > 0, file.exists(file_path))
   jitter <- function(s) s + runif(1, 0, 0.4)
   
-  last_sc <- NA_integer_
-  last_body <- NULL
-  
+  last_sc <- NA_integer_; last_body <- NULL
   for (i in seq_len(retries)) {
     resp <- tryCatch(
       httr::POST(
@@ -1389,84 +1386,126 @@ post_file_with_retry <- function(webhook, file_path, content = NULL, retries = 4
       ),
       error = function(e) NULL
     )
-    
-    if (is.null(resp)) { Sys.sleep(jitter(1.0)); next }
+    if (is.null(resp)) { message("POST error (network). Retry…"); Sys.sleep(jitter(1.0)); next }
     
     sc <- httr::status_code(resp)
-    if (sc %in% c(200, 204)) return(list(ok = TRUE, status = sc))
+    if (sc %in% c(200,204)) return(list(ok = TRUE, status = sc))
     
+    # Discord 429 (rate limit)
     if (sc == 429L) {
       h <- httr::headers(resp)
       wait <- NA_real_
       if (!is.null(h[["retry-after"]])) wait <- as.numeric(h[["retry-after"]]) / 1000
       if (is.na(wait) && !is.null(h[["x-ratelimit-reset-after"]])) wait <- as.numeric(h[["x-ratelimit-reset-after"]])
       if (is.na(wait)) wait <- 2.0
-      Sys.sleep(jitter(wait))
-      last_sc <- sc
-      last_body <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) NA_character_)
-      next
+      message(glue("Hit 429; sleeping {wait}s…"))
+      Sys.sleep(jitter(wait)); next
     }
     
-    if (sc >= 500L || sc == 408L) { Sys.sleep(jitter(1.2)); last_sc <- sc; next }
+    # transient server errors
+    if (sc >= 500L || sc == 408L) { message(glue("Server {sc}; retry…")); Sys.sleep(jitter(1.3)); next }
     
     last_sc <- sc
     last_body <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) NA_character_)
+    message(glue("Upload failed: HTTP {sc} — {substr(last_body %||% '', 1, 120)}"))
     break
   }
-  
   list(ok = FALSE, status = last_sc, body = last_body)
 }
 
 # ------------------------------------------------------------------
-# 3) Table → PNG with Chrome first, PhantomJS fallback
+# 3) Render a gt table to PNG with fallback + diagnostics
 # ------------------------------------------------------------------
-send_df_as_png <- function(webhook, df, title = NULL, file_path = NULL) {
-  if (nrow(df) == 0) return(FALSE)
-  
-  if (is.null(file_path)) {
-    file_path <- sprintf("%s.png", gsub("[^A-Za-z0-9]+", "_", tolower(title %||% "table")))
-  }
+render_gt_png <- function(tbl_gt, file_path, prefer_chromote = TRUE, vwidth = 1200L, zoom = 2) {
   file_path <- normalizePath(file_path, mustWork = FALSE)
+  # ensure parent dir
+  dir.create(dirname(file_path), showWarnings = FALSE, recursive = TRUE)
+  
+  # Try chromote/webshot2 through gt::gtsave
+  tried_chromote <- FALSE; saved <- FALSE; stage <- NULL
+  
+  if (prefer_chromote && ensure_headless_chrome()) {
+    tried_chromote <- TRUE
+    saved <- isTRUE(tryCatch({
+      gt::gtsave(tbl_gt, file_path, expand = 10)
+      file.exists(file_path)
+    }, error = function(e) { message("gtsave(chromote) error: ", e$message); FALSE }))
+    if (saved) stage <- "chromote"
+  }
+  
+  # PhantomJS fallback
+  if (!saved && requireNamespace("webshot", quietly = TRUE)) {
+    if (!webshot::is_phantomjs_installed()) {
+      try(webshot::install_phantomjs(), silent = TRUE)
+    }
+    html_file <- tempfile(fileext = ".html")
+    cat(gt::as_raw_html(tbl_gt), file = html_file)
+    saved <- isTRUE(tryCatch({
+      webshot::webshot(html_file, file_path, vwidth = vwidth, zoom = zoom)
+      file.exists(file_path)
+    }, error = function(e) { message("webshot(phantomjs) error: ", e$message); FALSE }))
+    if (saved) stage <- "phantom"
+  }
+  
+  # last resort: downscale phantom more if big file
+  if (!saved && requireNamespace("webshot", quietly = TRUE)) {
+    html_file <- tempfile(fileext = ".html")
+    cat(gt::as_raw_html(tbl_gt), file = html_file)
+    saved <- isTRUE(tryCatch({
+      webshot::webshot(html_file, file_path, vwidth = 1000, zoom = 1.5)
+      file.exists(file_path)
+    }, error = function(e) FALSE))
+    if (saved) stage <- "phantom_lowres"
+  }
+  
+  list(saved = saved, stage = stage, path = file_path, size = if (file.exists(file_path)) file.info(file_path)$size else NA_real_)
+}
+
+# ------------------------------------------------------------------
+# 4) High-level: render & post a data.frame as PNG (with text fallback)
+# ------------------------------------------------------------------
+send_df_as_png <- function(webhook, df, title = NULL, file_stub = "table", prefer_chromote = TRUE) {
+  if (nrow(df) == 0) return(list(ok = FALSE, reason = "empty_df"))
+  
+  ts_suffix <- format(Sys.time(), "%Y%m%d%H%M%OS3")
+  file_path <- normalizePath(sprintf("%s_%s.png", file_stub, ts_suffix), mustWork = FALSE)
   
   tbl_gt <- df %>%
     gt() %>%
     tab_header(title = title) %>%
     opt_all_caps(FALSE) %>%
-    fmt_number(columns = everything(), decimals = 3)
+    fmt_number(columns = where(is.numeric), decimals = 3)
   
-  ok <- FALSE
+  r <- render_gt_png(tbl_gt, file_path, prefer_chromote = prefer_chromote)
+  message(glue("Rendered '{file_stub}' via {r$stage %||% 'none'}; saved={r$saved}; size={r$size}"))
   
-  # Try webshot2 (Chrome/Chromium)
-  if (ensure_headless_chrome()) {
-    ok <- tryCatch({
-      gt::gtsave(tbl_gt, file_path, expand = 10)
-      file.exists(file_path)
-    }, error = function(e) FALSE)
+  if (!isTRUE(r$saved)) {
+    # text fallback
+    txt <- paste0("**", title %||% "Table", "** (image render failed)\n",
+                  paste(capture.output(print(utils::head(df, 15))), collapse = "\n"))
+    msg <- tryCatch({
+      httr::POST(url = webhook, body = list(content = txt), encode = "multipart")
+    }, error = function(e) NULL)
+    ok <- !is.null(msg) && httr::status_code(msg) %in% c(200,204)
+    return(list(ok = ok, fallback_text = TRUE, path = NULL))
   }
   
-  # Fallback: webshot (PhantomJS)
-  if (!ok) {
-    if (requireNamespace("webshot", quietly = TRUE)) {
-      if (!webshot::is_phantomjs_installed()) {
-        try(webshot::install_phantomjs(), silent = TRUE)
-      }
-      html_file <- tempfile(fileext = ".html")
-      cat(gt::as_raw_html(tbl_gt), file = html_file)
-      ok <- tryCatch({
-        webshot::webshot(html_file, file_path, vwidth = 1200, zoom = 2)
-        file.exists(file_path)
-      }, error = function(e) FALSE)
+  u <- post_file_with_retry(webhook, r$path, content = title)
+  if (!isTRUE(u$ok)) {
+    # Try once more with lower-res phantom image
+    r2 <- render_gt_png(tbl_gt, file_path = sub("\\.png$", "_low.png", r$path), prefer_chromote = FALSE, vwidth = 1000, zoom = 1.4)
+    message(glue("Re-rendered low-res via {r2$stage %||% 'none'}; saved={r2$saved}; size={r2$size}"))
+    if (isTRUE(r2$saved)) {
+      u2 <- post_file_with_retry(webhook, r2$path, content = paste0(title, " (low-res)"))
+      return(list(ok = isTRUE(u2$ok), path = r2$path, lowres = TRUE))
     }
+    return(list(ok = FALSE, path = r$path, status = u$status))
   }
-  
-  if (!ok) return(FALSE)
-  
-  res <- post_file_with_retry(webhook, file_path, content = title)
-  isTRUE(res$ok)
+  list(ok = TRUE, path = r$path)
 }
 
 # ------------------------------------------------------------------
-# 4) Helpers: safe coalescer that only uses columns that exist
+# 5) Safe helpers for picking / coercion
 # ------------------------------------------------------------------
 coalesce_pick <- function(.picked, cols, default = NA_character_) {
   vecs <- lapply(cols, function(nm) if (nm %in% names(.picked)) .picked[[nm]] else NULL)
@@ -1474,7 +1513,6 @@ coalesce_pick <- function(.picked, cols, default = NA_character_) {
   if (length(vecs) == 0) return(rep(default, nrow(.picked)))
   Reduce(dplyr::coalesce, vecs)
 }
-
 num_pick <- function(.picked, nm) {
   x <- .picked[[nm]]
   if (is.null(x)) return(rep(NA_real_, nrow(.picked)))
@@ -1482,13 +1520,14 @@ num_pick <- function(.picked, nm) {
 }
 
 # ------------------------------------------------------------------
-# 5) Main: filter window, build spreads + totals, post both
+# 6) Main entry: build tables and send both (with sequencing & pause)
 # ------------------------------------------------------------------
 post_window_picks_to_discord_png <- function(final_2025_out,
                                              webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
                                              days_min = 3L, days_max = 14L,
                                              tz = "UTC",
-                                             pause_between_secs = 1.4) {
+                                             pause_between_secs = 1.5,
+                                             prefer_chromote = TRUE) {
   if (!nzchar(webhook)) return(invisible(FALSE))
   
   now_utc <- lubridate::now(tzone = tz)
@@ -1499,27 +1538,21 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01")) %>%
     filter(startDate >= min_dt, startDate <= max_dt)
   
-  # --- Spreads ---
+  # Spreads table
   spreads <- df %>%
     mutate(spread_unit_num = num_pick(pick(everything()), "spread_unit")) %>%
     filter(!is.na(best_book), spread_unit_num >= 1) %>%
     transmute(
       team, opponent, best_book, spread_pick,
-      spread_hit_probability,
-      spread_unit = spread_unit_num
+      spread_hit_probability, spread_unit = spread_unit_num
     ) %>%
     arrange(desc(spread_hit_probability))
   
-  # --- Totals ---
-  # Only use columns that actually exist in your frame:
-  # from your colnames() we have best_ou_book and best_book (but not ou_best_book / best_total_book)
+  # Totals table (use only columns that exist in your frame)
   totals <- df %>%
     mutate(
       ou_unit_num  = num_pick(pick(everything()), "ou_unit"),
-      best_ou_book2 = coalesce_pick(
-        pick(everything()),
-        c("best_ou_book", "best_book")  # <- only existing fallbacks
-      )
+      best_ou_book2 = coalesce_pick(pick(everything()), c("best_ou_book", "best_book"))
     ) %>%
     filter(!is.na(best_ou_book2), ou_unit_num >= 1) %>%
     transmute(
@@ -1534,40 +1567,44 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     format(min_dt, "%Y-%m-%d %H:%M", tz = tz), " → ",
     format(max_dt, "%Y-%m-%d %H:%M", tz = tz), " (", tz, ")"
   )
-  
   message(glue("Will send {nrow(spreads)} spread rows and {nrow(totals)} total rows in window {window_str}"))
   
-  ts_suffix <- format(Sys.time(), "%Y%m%d%H%M%S")
-  sent1 <- sent2 <- FALSE
+  sent_spreads <- sent_totals <- FALSE
   
   if (nrow(spreads)) {
-    sent1 <- send_df_as_png(
+    rs <- send_df_as_png(
       webhook,
       spreads,
       title = paste0("Spread picks (units ≥ 1) — window: ", window_str),
-      file_path = paste0("spreads_table_", ts_suffix, ".png")
+      file_stub = "spreads_table",
+      prefer_chromote = prefer_chromote
     )
-    message(glue("Spreads posted: {sent1}"))
+    sent_spreads <- isTRUE(rs$ok)
+    message(glue("Spreads posted: {sent_spreads}"))
+    if (sent_spreads) Sys.sleep(pause_between_secs)
   }
   
   if (nrow(totals)) {
-    if (sent1) Sys.sleep(pause_between_secs)  # small gap helps avoid 429s
-    sent2 <- send_df_as_png(
+    rt <- send_df_as_png(
       webhook,
       totals,
       title = paste0("Totals picks (units ≥ 1) — window: ", window_str),
-      file_path = paste0("totals_table_", ts_suffix, ".png")
+      file_stub = "totals_table",
+      prefer_chromote = prefer_chromote
     )
-    message(glue("Totals posted: {sent2}"))
+    sent_totals <- isTRUE(rt$ok)
+    message(glue("Totals posted: {sent_totals}"))
   }
   
-  invisible(list(spreads = nrow(spreads), totals = nrow(totals), sent_spreads = sent1, sent_totals = sent2))
+  invisible(list(spreads = nrow(spreads), totals = nrow(totals),
+                 sent_spreads = sent_spreads, sent_totals = sent_totals))
 }
 
 # ------------------------------------------------------------------
-# 6) Run it (expects final_2025_out to exist in the environment)
+# 7) Run it (expects final_2025_out to exist in the environment)
 # ------------------------------------------------------------------
 post_window_picks_to_discord_png(final_2025_out, webhook = GAME_PICK_WEBHOOK)
+
 
 
 # suppressPackageStartupMessages({
