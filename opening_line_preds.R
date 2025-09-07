@@ -1390,9 +1390,7 @@ post_file_with_retry <- function(webhook, file_path, content = NULL, retries = 4
       error = function(e) NULL
     )
     
-    if (is.null(resp)) {
-      Sys.sleep(jitter(1.0)); next
-    }
+    if (is.null(resp)) { Sys.sleep(jitter(1.0)); next }
     
     sc <- httr::status_code(resp)
     if (sc %in% c(200, 204)) return(list(ok = TRUE, status = sc))
@@ -1409,9 +1407,7 @@ post_file_with_retry <- function(webhook, file_path, content = NULL, retries = 4
       next
     }
     
-    if (sc >= 500L || sc == 408L) {
-      Sys.sleep(jitter(1.2)); last_sc <- sc; next
-    }
+    if (sc >= 500L || sc == 408L) { Sys.sleep(jitter(1.2)); last_sc <- sc; next }
     
     last_sc <- sc
     last_body <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) NA_character_)
@@ -1470,7 +1466,23 @@ send_df_as_png <- function(webhook, df, title = NULL, file_path = NULL) {
 }
 
 # ------------------------------------------------------------------
-# 4) Main: filter window, build spreads + totals, post both
+# 4) Helpers: safe coalescer that only uses columns that exist
+# ------------------------------------------------------------------
+coalesce_pick <- function(.picked, cols, default = NA_character_) {
+  vecs <- lapply(cols, function(nm) if (nm %in% names(.picked)) .picked[[nm]] else NULL)
+  vecs <- Filter(Negate(is.null), vecs)
+  if (length(vecs) == 0) return(rep(default, nrow(.picked)))
+  Reduce(dplyr::coalesce, vecs)
+}
+
+num_pick <- function(.picked, nm) {
+  x <- .picked[[nm]]
+  if (is.null(x)) return(rep(NA_real_, nrow(.picked)))
+  suppressWarnings(as.numeric(x))
+}
+
+# ------------------------------------------------------------------
+# 5) Main: filter window, build spreads + totals, post both
 # ------------------------------------------------------------------
 post_window_picks_to_discord_png <- function(final_2025_out,
                                              webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
@@ -1487,11 +1499,9 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01")) %>%
     filter(startDate >= min_dt, startDate <= max_dt)
   
-  # --- Spreads (robust numeric cast) ---
+  # --- Spreads ---
   spreads <- df %>%
-    mutate(
-      spread_unit_num = suppressWarnings(as.numeric(spread_unit))
-    ) %>%
+    mutate(spread_unit_num = num_pick(pick(everything()), "spread_unit")) %>%
     filter(!is.na(best_book), spread_unit_num >= 1) %>%
     transmute(
       team, opponent, best_book, spread_pick,
@@ -1500,18 +1510,18 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     ) %>%
     arrange(desc(spread_hit_probability))
   
-  # --- Totals (robust numeric cast + book fallbacks) ---
+  # --- Totals ---
+  # Only use columns that actually exist in your frame:
+  # from your colnames() we have best_ou_book and best_book (but not ou_best_book / best_total_book)
   totals <- df %>%
     mutate(
-      ou_unit_num = suppressWarnings(as.numeric(ou_unit)),
-      best_ou_book2 = dplyr::coalesce(
-        best_ou_book,
-        best_book,        # fallback if only one "best" name exists
-        ou_best_book,     # other possible pipeline name
-        best_total_book
+      ou_unit_num  = num_pick(pick(everything()), "ou_unit"),
+      best_ou_book2 = coalesce_pick(
+        pick(everything()),
+        c("best_ou_book", "best_book")  # <- only existing fallbacks
       )
     ) %>%
-    filter(ou_unit_num >= 1) %>%
+    filter(!is.na(best_ou_book2), ou_unit_num >= 1) %>%
     transmute(
       team, opponent,
       best_ou_book = best_ou_book2,
@@ -1555,10 +1565,8 @@ post_window_picks_to_discord_png <- function(final_2025_out,
 }
 
 # ------------------------------------------------------------------
-# 5) Run it
+# 6) Run it (expects final_2025_out to exist in the environment)
 # ------------------------------------------------------------------
-# Assumes you have a data.frame `final_2025_out` in scope with the columns used above.
-# Example call (keep as-is):
 post_window_picks_to_discord_png(final_2025_out, webhook = GAME_PICK_WEBHOOK)
 
 
