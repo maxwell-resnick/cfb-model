@@ -1325,7 +1325,9 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(lubridate)
   library(gt)
-  library(webshot2) # gtsave backend
+  library(webshot2)  # preferred renderer (Chrome/Chromium via chromote)
+  library(httr)
+  library(glue)
 })
 
 # ------------------------------------------------------------------
@@ -1336,15 +1338,16 @@ if (!nzchar(GAME_PICK_WEBHOOK)) {
   GAME_PICK_WEBHOOK <- "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
 }
 
+# ------------------------------------------------------------------
+# 1) Headless Chrome helper (works in CI/containers)
+# ------------------------------------------------------------------
 ensure_headless_chrome <- function() {
-  # Pass flags that work well in containers/CI
   options(chromote.chrome_args = c(
     "--headless=new",
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu"
   ))
-  # If CHROMOTE_CHROME not set, try common binaries
   if (!nzchar(Sys.getenv("CHROMOTE_CHROME", ""))) {
     candidates <- c(
       "/usr/bin/chromium-browser",
@@ -1364,24 +1367,70 @@ ensure_headless_chrome <- function() {
   ok
 }
 
-# ---------- Helper: safe numeric extractor (no cur_data_all() warning) ----------
-# Use within mutate(): ensure_num(pick(everything()), "col_name")
-ensure_num <- function(.picked, nm) {
-  x <- .picked[[nm]]
-  if (is.null(x)) return(rep(NA_real_, nrow(.picked)))
-  suppressWarnings(as.numeric(x))
+# ------------------------------------------------------------------
+# 2) Discord: rate-limit aware file poster with retries/backoff
+# ------------------------------------------------------------------
+post_file_with_retry <- function(webhook, file_path, content = NULL, retries = 4) {
+  stopifnot(nchar(webhook) > 0, file.exists(file_path))
+  jitter <- function(s) s + runif(1, 0, 0.4)
+  
+  last_sc <- NA_integer_
+  last_body <- NULL
+  
+  for (i in seq_len(retries)) {
+    resp <- tryCatch(
+      httr::POST(
+        url = webhook,
+        encode = "multipart",
+        body = c(
+          if (!is.null(content)) list(content = content) else list(),
+          list(file = httr::upload_file(file_path))
+        )
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(resp)) {
+      Sys.sleep(jitter(1.0)); next
+    }
+    
+    sc <- httr::status_code(resp)
+    if (sc %in% c(200, 204)) return(list(ok = TRUE, status = sc))
+    
+    if (sc == 429L) {
+      h <- httr::headers(resp)
+      wait <- NA_real_
+      if (!is.null(h[["retry-after"]])) wait <- as.numeric(h[["retry-after"]]) / 1000
+      if (is.na(wait) && !is.null(h[["x-ratelimit-reset-after"]])) wait <- as.numeric(h[["x-ratelimit-reset-after"]])
+      if (is.na(wait)) wait <- 2.0
+      Sys.sleep(jitter(wait))
+      last_sc <- sc
+      last_body <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) NA_character_)
+      next
+    }
+    
+    if (sc >= 500L || sc == 408L) {
+      Sys.sleep(jitter(1.2)); last_sc <- sc; next
+    }
+    
+    last_sc <- sc
+    last_body <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) NA_character_)
+    break
+  }
+  
+  list(ok = FALSE, status = last_sc, body = last_body)
 }
 
-ensure_signed_spread <- function(.picked, nm) {
-  x <- ensure_num(.picked, nm)
-  is_home <- .picked[["is_home"]]
-  if (is.null(is_home)) return(rep(NA_real_, nrow(.picked)))
-  ifelse(is_home == 1L, -x, x)
-}
-
-# ---------- PNG export with Chrome first, PhantomJS fallback ----------
-send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png") {
+# ------------------------------------------------------------------
+# 3) Table → PNG with Chrome first, PhantomJS fallback
+# ------------------------------------------------------------------
+send_df_as_png <- function(webhook, df, title = NULL, file_path = NULL) {
   if (nrow(df) == 0) return(FALSE)
+  
+  if (is.null(file_path)) {
+    file_path <- sprintf("%s.png", gsub("[^A-Za-z0-9]+", "_", tolower(title %||% "table")))
+  }
+  file_path <- normalizePath(file_path, mustWork = FALSE)
   
   tbl_gt <- df %>%
     gt() %>%
@@ -1403,7 +1452,6 @@ send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png
   if (!ok) {
     if (requireNamespace("webshot", quietly = TRUE)) {
       if (!webshot::is_phantomjs_installed()) {
-        # downloads PhantomJS for the runner
         try(webshot::install_phantomjs(), silent = TRUE)
       }
       html_file <- tempfile(fileext = ".html")
@@ -1417,38 +1465,59 @@ send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png
   
   if (!ok) return(FALSE)
   
-  # POST to Discord
-  httr::POST(
-    url = webhook,
-    httr::add_headers(`Content-Type` = "multipart/form-data"),
-    body = list(file = httr::upload_file(file_path))
-  ) |> httr::status_code() |> (\(sc) isTRUE(sc %in% c(200, 204)))()
+  res <- post_file_with_retry(webhook, file_path, content = title)
+  isTRUE(res$ok)
 }
 
+# ------------------------------------------------------------------
+# 4) Main: filter window, build spreads + totals, post both
+# ------------------------------------------------------------------
 post_window_picks_to_discord_png <- function(final_2025_out,
                                              webhook = Sys.getenv("GAME_PICK_WEBHOOK", unset = ""),
                                              days_min = 3L, days_max = 14L,
-                                             tz = "UTC") {
+                                             tz = "UTC",
+                                             pause_between_secs = 1.4) {
   if (!nzchar(webhook)) return(invisible(FALSE))
   
   now_utc <- lubridate::now(tzone = tz)
-  min_dt  <- now_utc + days(days_min)
-  max_dt  <- now_utc + days(days_max)
+  min_dt  <- now_utc + lubridate::days(days_min)
+  max_dt  <- now_utc + lubridate::days(days_max)
   
   df <- final_2025_out %>%
     mutate(startDate = as.POSIXct(startDate, tz = tz, origin = "1970-01-01")) %>%
     filter(startDate >= min_dt, startDate <= max_dt)
   
-  # Spread picks, descending by spread_hit_probability
+  # --- Spreads (robust numeric cast) ---
   spreads <- df %>%
-    filter(!is.na(best_book), spread_unit >= 1) %>%
-    select(team, opponent, best_book, spread_pick, spread_hit_probability, spread_unit) %>%
+    mutate(
+      spread_unit_num = suppressWarnings(as.numeric(spread_unit))
+    ) %>%
+    filter(!is.na(best_book), spread_unit_num >= 1) %>%
+    transmute(
+      team, opponent, best_book, spread_pick,
+      spread_hit_probability,
+      spread_unit = spread_unit_num
+    ) %>%
     arrange(desc(spread_hit_probability))
   
-  # Totals picks, descending by ou_hit_probability
+  # --- Totals (robust numeric cast + book fallbacks) ---
   totals <- df %>%
-    filter(!is.na(best_ou_book), ou_unit >= 1) %>%
-    select(team, opponent, best_ou_book, ou_pick_str, ou_hit_probability, ou_unit) %>%
+    mutate(
+      ou_unit_num = suppressWarnings(as.numeric(ou_unit)),
+      best_ou_book2 = dplyr::coalesce(
+        best_ou_book,
+        best_book,        # fallback if only one "best" name exists
+        ou_best_book,     # other possible pipeline name
+        best_total_book
+      )
+    ) %>%
+    filter(ou_unit_num >= 1) %>%
+    transmute(
+      team, opponent,
+      best_ou_book = best_ou_book2,
+      ou_pick_str, ou_hit_probability,
+      ou_unit = ou_unit_num
+    ) %>%
     arrange(desc(ou_hit_probability))
   
   window_str <- paste0(
@@ -1456,37 +1525,42 @@ post_window_picks_to_discord_png <- function(final_2025_out,
     format(max_dt, "%Y-%m-%d %H:%M", tz = tz), " (", tz, ")"
   )
   
+  message(glue("Will send {nrow(spreads)} spread rows and {nrow(totals)} total rows in window {window_str}"))
+  
+  ts_suffix <- format(Sys.time(), "%Y%m%d%H%M%S")
   sent1 <- sent2 <- FALSE
+  
   if (nrow(spreads)) {
     sent1 <- send_df_as_png(
       webhook,
       spreads,
       title = paste0("Spread picks (units ≥ 1) — window: ", window_str),
-      file_path = "spreads_table.png"
+      file_path = paste0("spreads_table_", ts_suffix, ".png")
     )
+    message(glue("Spreads posted: {sent1}"))
   }
+  
   if (nrow(totals)) {
+    if (sent1) Sys.sleep(pause_between_secs)  # small gap helps avoid 429s
     sent2 <- send_df_as_png(
       webhook,
       totals,
       title = paste0("Totals picks (units ≥ 1) — window: ", window_str),
-      file_path = "totals_table.png"
+      file_path = paste0("totals_table_", ts_suffix, ".png")
     )
+    message(glue("Totals posted: {sent2}"))
   }
   
-  # # fallback message if nothing qualifies
-  # if (!sent1 && !sent2) {
-  #   msg <- paste0(
-  #     "**No qualifying picks** in window ", window_str,
-  #     " (spreads: units ≥ 1 & book present; totals: units ≥ 1 & book present)."
-  #   )
-  #   isTRUE(send_discord(webhook, content = msg))
-  # }
-  
-  invisible(list(spreads = nrow(spreads), totals = nrow(totals)))
+  invisible(list(spreads = nrow(spreads), totals = nrow(totals), sent_spreads = sent1, sent_totals = sent2))
 }
 
+# ------------------------------------------------------------------
+# 5) Run it
+# ------------------------------------------------------------------
+# Assumes you have a data.frame `final_2025_out` in scope with the columns used above.
+# Example call (keep as-is):
 post_window_picks_to_discord_png(final_2025_out, webhook = GAME_PICK_WEBHOOK)
+
 
 # suppressPackageStartupMessages({
 #   library(DBI)
