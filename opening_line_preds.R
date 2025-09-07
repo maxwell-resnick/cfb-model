@@ -340,6 +340,7 @@ xgb_2025 <- xgb_2025 %>%
     opponent_talent_scaled = as.numeric(scale(opponent_talent))
   ) %>% ungroup()
 
+# If helpers aren't defined upstream:
 if (!exists("short_bm", mode = "function")) {
   short_bm <- function(x) {
     dplyr::recode(x,
@@ -350,7 +351,6 @@ if (!exists("short_bm", mode = "function")) {
     )
   }
 }
-# if team_map wasn't defined above, fall back to identity map (no standardization)
 if (!exists("team_map")) team_map <- setNames(character(0), character(0))
 normalize_team <- function(x) {
   out <- unname(team_map[match(x, names(team_map))])
@@ -450,12 +450,10 @@ final_df <- final_df %>%
 # =========================
 # Merge onto combined_2025
 # =========================
-
-# date-only join keys (normalized to UTC)
 xgb_2025_key <- xgb_2025 %>%
   dplyr::mutate(
     start_dt_utc = lubridate::ymd_hms(startDate, tz = "UTC"),
-    game_date    = as.Date(start_dt_utc)   # POSIXct has tz='UTC' now
+    game_date    = as.Date(start_dt_utc)
   )
 
 final_df_key <- final_df %>%
@@ -466,37 +464,30 @@ final_df_key <- final_df %>%
   dplyr::select(-commence_time, -commence_dt_utc) %>%
   dplyr::distinct()
 
-
-# columns from final_df to carry over
 book_cols <- names(final_df_key)
-book_cols <- setdiff(book_cols, c("id","game_date","team","opponent"))  # keep is_home + dk/fd/mgm cols
+book_cols <- setdiff(book_cols, c("id","game_date","team","opponent"))
 
-# handy coalescer for same-named columns across frames
 coalesce_cols <- function(base, a, b, cols) {
   for (nm in cols) base[[nm]] <- dplyr::coalesce(base[[nm]], a[[nm]], b[[nm]])
   base
 }
 
-# strict: date + team + opponent
 j_strict <- xgb_2025_key %>%
   dplyr::left_join(final_df_key,
                    by = c("game_date"="game_date","team"="team","opponent"="opponent"),
                    suffix = c("", ".final"))
 
-# fallback A: date + team
 j_team <- xgb_2025_key %>%
   dplyr::left_join(final_df_key,
                    by = c("game_date"="game_date","team"="team"),
                    suffix = c("", ".byteam"))
 
-# fallback B: date + opponent
 j_opp <- xgb_2025_key %>%
   dplyr::left_join(final_df_key,
                    by = c("game_date"="game_date","opponent"="opponent"),
                    suffix = c("", ".byopp"))
 
 merged_df <- j_strict %>% coalesce_cols(j_team, j_opp, book_cols)
-
 
 # ------------------------------------------------------------------------------
 # 3) percentPPA map for 2025
@@ -514,8 +505,6 @@ ensure_num <- function(.data, nm) {
   if (nm %in% names(.data)) suppressWarnings(as.numeric(.data[[nm]]))
   else rep(NA_real_, nrow(.data))
 }
-
-# Signed spread from legacy DB books (flip for home team); if source missing → NA
 ensure_signed_spread <- function(.data, nm) {
   x <- ensure_num(.data, nm)
   if (!"is_home" %in% names(.data)) return(rep(NA_real_, nrow(.data)))
@@ -524,46 +513,38 @@ ensure_signed_spread <- function(.data, nm) {
 
 merged_df <- merged_df %>%
   mutate(
-    # ---- OddsAPI books (already team-perspective) ----
-    # DraftKings (use ONLY the OddsAPI fields)
     dk_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_dk"),
     dk_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_dk"),
     dk_formatted_overunder         = ensure_num(cur_data_all(), "total_num_dk"),
     dk_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_dk"),
     dk_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_dk"),
     
-    # FanDuel
     fd_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_fd"),
     fd_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_fd"),
     fd_formatted_overunder         = ensure_num(cur_data_all(), "total_num_fd"),
     fd_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_fd"),
     fd_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_fd"),
     
-    # BetMGM
     mgm_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_mgm"),
     mgm_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_mgm"),
     mgm_formatted_overunder         = ensure_num(cur_data_all(), "total_num_mgm"),
     mgm_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_mgm"),
     mgm_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_mgm"),
     
-    # ---- Legacy DB books (need home/away sign) ----
-    # Bovada
     bovada_formatted_spread            = ensure_signed_spread(cur_data_all(), "bovada_spread"),
     bovada_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "bovada_opening_spread"),
     bovada_formatted_overunder         = ensure_num(cur_data_all(), "bovada_overunder"),
     bovada_formatted_opening_overunder = ensure_num(cur_data_all(), "bovada_opening_overunder"),
     
-    # ESPN Bet
     espnbet_formatted_spread            = ensure_signed_spread(cur_data_all(), "espnbet_spread"),
     espnbet_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "espnbet_opening_spread"),
     espnbet_formatted_overunder         = ensure_num(cur_data_all(), "espnbet_overunder"),
     espnbet_formatted_opening_overunder = ensure_num(cur_data_all(), "espnbet_opening_overunder")
   ) %>%
-  # Safe even if no matching columns exist:
   select(-starts_with("draftkings_"))
 
 # ------------------------------------------------------------------------------
-# 5) Team-centric points + percentPPA attach
+# 5) Team-centric points + percentPPA attach (unchanged)
 # ------------------------------------------------------------------------------
 spread_scores_keys_2025 <- merged_df %>%
   mutate(
@@ -592,13 +573,11 @@ spread_scores_keys_2025 <- merged_df %>%
   select(
     id, season, week, team, opponent, startDate,
     
-    # DB / legacy books (signed with is_home earlier)
     bovada_formatted_spread, bovada_formatted_opening_spread,
     bovada_formatted_overunder, bovada_formatted_opening_overunder,
     espnbet_formatted_spread, espnbet_formatted_opening_spread,
     espnbet_formatted_overunder, espnbet_formatted_opening_overunder,
     
-    # OddsAPI books (team-perspective)
     dk_formatted_spread,          dk_formatted_spread_price,
     dk_formatted_overunder,       dk_formatted_total_over_price,   dk_formatted_total_under_price,
     fd_formatted_spread,          fd_formatted_spread_price,
@@ -606,10 +585,8 @@ spread_scores_keys_2025 <- merged_df %>%
     mgm_formatted_spread,         mgm_formatted_spread_price,
     mgm_formatted_overunder,      mgm_formatted_total_over_price,  mgm_formatted_total_under_price,
     
-    # optional averages if you created them
     dplyr::any_of(c("formatted_spread_avg","formatted_total_avg")),
     
-    # targets + features
     team_points, opponent_points, score_diff,
     team_talent_scaled, opponent_talent_scaled,
     team_percentPPA, opponent_percentPPA,
@@ -617,8 +594,174 @@ spread_scores_keys_2025 <- merged_df %>%
   ) %>%
   distinct(season, week, team, opponent, .keep_all = TRUE)
 
-source("./kalman_filter.R")
-pregame_latents <- get_pregame_latents()
+# ======================================================================
+# NEW METHOD: Fit ONCE on 2017+ and build pregame_latents for 2025 games
+# ======================================================================
+
+# -- A) Pull full training set (2017+), preprocess for glmmTMB
+model_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season >= 2017;') %>%
+  mutate(
+    season = as.numeric(season),
+    week   = as.numeric(week),
+    team   = as.character(team),
+    opponent = as.character(opponent),
+    
+    passing_plays  = offense_passingPlays.totalPPA  / offense_passingPlays.ppa,
+    rushing_plays  = offense_rushingPlays.totalPPA  / offense_rushingPlays.ppa,
+    passing_rate   = passing_plays / (passing_plays + rushing_plays),
+    points_above_average         = offense_ppa * 65,
+    passing_points_above_average = offense_passingPlays.ppa * 65,
+    rushing_points_above_average = offense_rushingPlays.ppa * 65,
+    is_home = ifelse(homeTeam == team, 1, 0)
+  ) %>%
+  group_by(season) %>%
+  mutate(
+    team_talent_scaled     = as.numeric(scale(team_talent)),
+    opponent_talent_scaled = as.numeric(scale(opponent_talent))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    season_f = factor(season),
+    team_f   = factor(team),
+    opponent_f = factor(opponent),
+    team_season_f     = interaction(team_f, season_f, drop = TRUE),
+    opponent_season_f = interaction(opponent_f, season_f, drop = TRUE),
+    season_num = numFactor(season),
+    week_num   = numFactor(week)
+  )
+
+# -- B) Fit once per response
+form_base <- function(resp) as.formula(paste0(
+  resp, " ~ 0 + is_home + team_talent_scaled + opponent_talent_scaled + ",
+  "ou(season_num + 0 | team_f) + ou(season_num + 0 | opponent_f) + ",
+  "ou(week_num + 0 | team_season_f) + ou(week_num + 0 | opponent_season_f)"
+))
+
+fit_overall <- glmmTMB(form_base("points_above_average"),         data = model_df, family = gaussian(), REML = FALSE)
+fit_passing <- glmmTMB(form_base("passing_points_above_average"), data = model_df, family = gaussian(), REML = FALSE)
+fit_rushing <- glmmTMB(form_base("rushing_points_above_average"), data = model_df, family = gaussian(), REML = FALSE)
+
+# (optional) Save models
+# library(qs); dir.create("models", showWarnings = FALSE, recursive = TRUE)
+# qsave(fit_overall, "models/fit_overall_2017present.qs")
+# qsave(fit_passing, "models/fit_passing_2017present.qs")
+# qsave(fit_rushing, "models/fit_rushing_2017present.qs")
+
+# -- C) Helpers to extract OU ranefs (pivot ALL columns long)
+get_re_part <- function(re_cond, name) {
+  if (is.null(re_cond)) return(NULL)
+  nms <- names(re_cond)
+  if (name %in% nms) return(re_cond[[name]])
+  hit <- nms[str_detect(nms, fixed(name))]
+  if (length(hit)) return(re_cond[[hit[1]]])
+  NULL
+}
+pivot_re_matrix <- function(M) {
+  if (is.null(M)) return(tibble(group = character(), col = character(), value = numeric()))
+  mm <- as.matrix(M)
+  tb <- as_tibble(mm, .name_repair = "minimal")
+  tb$group <- rownames(mm)
+  tb %>% pivot_longer(cols = -group, names_to = "col", values_to = "value")
+}
+parse_season_ou_tbl <- function(M, who = c("team","opponent")) {
+  who <- match.arg(who)
+  L <- pivot_re_matrix(M)
+  if (!nrow(L)) return(tibble(!!who := character(), season = numeric(), value_season = numeric()))
+  season <- suppressWarnings(as.numeric(str_match(L$col, "season_num\\(([-0-9.]+)\\)")[,2]))
+  tibble(!!who := L$group, season = season, value_season = L$value) %>%
+    filter(!is.na(season))
+}
+parse_week_ou_tbl <- function(M, who = c("team","opponent")) {
+  who <- match.arg(who)
+  L <- pivot_re_matrix(M)
+  if (!nrow(L)) return(tibble(!!who := character(), season = numeric(), week = numeric(), value_week = numeric()))
+  entity  <- sub("([:.][0-9]+)+$", "", L$group)  # strip trailing .YYYY
+  season  <- suppressWarnings(as.numeric(str_match(L$group, "([0-9]+)$")[,2]))
+  week    <- suppressWarnings(as.numeric(str_match(L$col, "week_num\\(([-0-9.]+)\\)")[,2]))
+  tibble(!!who := entity, season = season, week = week, value_week = L$value) %>%
+    filter(!is.na(season), !is.na(week))
+}
+get_betas <- function(fit) {
+  cf <- summary(fit)$coefficients$cond
+  out <- tibble(term = rownames(cf), beta = as.numeric(cf[, "Estimate"])) %>%
+    filter(term %in% c("team_talent_scaled","opponent_talent_scaled")) %>%
+    pivot_wider(names_from = term, values_from = beta, values_fill = 0)
+  if (!"team_talent_scaled" %in% names(out)) out$team_talent_scaled <- 0
+  if (!"opponent_talent_scaled" %in% names(out)) out$opponent_talent_scaled <- 0
+  out
+}
+extract_full_tables <- function(fit) {
+  re_cond <- ranef(fit, condVar = FALSE)$cond
+  list(
+    team_season_tbl = parse_season_ou_tbl(get_re_part(re_cond, "team_f"), "team"),
+    opp_season_tbl  = parse_season_ou_tbl(get_re_part(re_cond, "opponent_f"), "opponent"),
+    team_week_tbl   = parse_week_ou_tbl(get_re_part(re_cond, "team_season_f"), "team"),
+    opp_week_tbl    = parse_week_ou_tbl(get_re_part(re_cond, "opponent_season_f"), "opponent"),
+    betas           = get_betas(fit)
+  )
+}
+pregame_from_fit_given_games <- function(games_df, fit, tag) {
+  tabs <- extract_full_tables(fit)
+  beta_team <- tabs$betas$team_talent_scaled[1]
+  beta_opp  <- tabs$betas$opponent_talent_scaled[1]
+  
+  games <- games_df %>%
+    select(season, week, team, opponent, team_talent_scaled, opponent_talent_scaled) %>%
+    mutate(week_prev = ifelse(is.finite(week) & week > 1, week - 1, NA_real_))
+  
+  out <- games %>%
+    left_join(tabs$team_season_tbl, by = c("team","season")) %>%
+    rename(team_value_season = value_season) %>%
+    left_join(tabs$opp_season_tbl,  by = c("opponent","season")) %>%
+    rename(opp_value_season  = value_season) %>%
+    left_join(tabs$team_week_tbl, by = c("team","season","week_prev"="week")) %>%
+    rename(team_value_week_prev = value_week) %>%
+    left_join(tabs$opp_week_tbl,  by = c("opponent","season","week_prev"="week")) %>%
+    rename(opp_value_week_prev  = value_week) %>%
+    mutate(
+      team_random_entering = coalesce(team_value_season, 0) + coalesce(team_value_week_prev, 0),
+      opp_random_entering  = coalesce(opp_value_season,  0) + coalesce(opp_value_week_prev,  0),
+      team_talent_term     = team_talent_scaled     * beta_team,
+      opp_talent_term      = opponent_talent_scaled * beta_opp,
+      team_effect_entering = team_random_entering + team_talent_term,
+      opp_effect_entering  = opp_random_entering  + opp_talent_term
+    ) %>%
+    select(season, week, team, opponent,
+           team_random_entering, team_talent_term, team_effect_entering,
+           opp_random_entering,  opp_talent_term,  opp_effect_entering) %>%
+    rename(
+      !!paste0(tag, "_team_random_entering") := team_random_entering,
+      !!paste0(tag, "_team_talent_term")     := team_talent_term,
+      !!paste0(tag, "_team_effect_entering") := team_effect_entering,
+      !!paste0(tag, "_opp_random_entering")  := opp_random_entering,
+      !!paste0(tag, "_opp_talent_term")      := opp_talent_term,
+      !!paste0(tag, "_opp_effect_entering")  := opp_effect_entering
+    )
+  
+  out
+}
+
+# -- D) Build 2025 pregame latents from the single fits
+overall_2025 <- pregame_from_fit_given_games(spread_scores_keys_2025, fit_overall, "overall")
+passing_2025 <- pregame_from_fit_given_games(spread_scores_keys_2025, fit_passing, "passing")
+rushing_2025 <- pregame_from_fit_given_games(spread_scores_keys_2025, fit_rushing, "rushing")
+
+entering_effects_2025 <- overall_2025 %>%
+  full_join(passing_2025, by = c("season","week","team","opponent")) %>%
+  full_join(rushing_2025, by = c("season","week","team","opponent")) %>%
+  arrange(week, team, opponent)
+
+# Final names you asked for (offense=team, defense=opponent)
+pregame_latents <- entering_effects_2025 %>%
+  transmute(
+    season, week, team, opponent,
+    offense_effect_overall = overall_team_effect_entering,
+    offense_effect_passing = passing_team_effect_entering,
+    offense_effect_rushing = rushing_team_effect_entering,
+    defense_effect_overall = overall_opp_effect_entering,
+    defense_effect_passing = passing_opp_effect_entering,
+    defense_effect_rushing = rushing_opp_effect_entering
+  )
 
 avg_row <- function(...) {
   x <- rowMeans(cbind(...), na.rm = TRUE)

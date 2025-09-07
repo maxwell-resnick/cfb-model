@@ -350,7 +350,7 @@ combined_df <- combined_features %>%
     by = c("season","week","team","opponent")
   )
 
-model_df <- combined_df %>% filter(season >= 2021)
+model_df <- combined_df %>% filter(season >= 2021, season <= 2024)
 
 
 suppressPackageStartupMessages({
@@ -419,14 +419,14 @@ features <- c(
 )
 
 cv_xgb <- model_df %>%
-  group_by(id) %>% filter(n()==2) %>% ungroup() %>%
+  group_by(id) %>% filter(n() == 2) %>% ungroup() %>%
   filter(is.finite(vegas_team_points), is.finite(formatted_spread)) %>%
   mutate(across(all_of(features), as.numeric))
 
 set.seed(2025)
 
 fold_map <- cv_xgb %>% distinct(id) %>% mutate(fold = sample(rep(1:5, length.out = n())))
-cv_xgb <- cv_xgb %>% left_join(fold_map, by = "id")
+cv_xgb   <- cv_xgb %>% left_join(fold_map, by = "id")
 
 X_all <- as.matrix(cv_xgb[, features])
 y_all <- cv_xgb$vegas_team_points
@@ -439,6 +439,7 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
     booster          = "gbtree",
     objective        = "reg:squarederror",
     eval_metric      = "rmse",
+    # tuned knobs
     max_depth        = as.integer(round(max_depth)),
     min_child_weight = min_child_weight,
     subsample        = subsample,
@@ -446,11 +447,12 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
     eta              = eta,
     gamma            = gamma,
     lambda           = lambda,
-    alpha            = alpha
+    alpha            = alpha,
+    tree_method      = "hist",
+    nthread          = 1
   )
   
   set.seed(2025)
-  
   fold_rmses  <- numeric(length(folds))
   fold_bestit <- integer(length(folds))
   
@@ -462,13 +464,13 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
     dval <- xgb.DMatrix(data = X_all[val_idx, , drop = FALSE], label = y_all[val_idx], missing = NA)
     
     fit <- xgb.train(
-      params = params,
-      data   = dtr,
+      params  = params,
+      data    = dtr,
       nrounds = 1000,
       watchlist = list(train = dtr, val = dval),
-      early_stopping_rounds = 20,
+      early_stopping_rounds = 50,
       maximize = FALSE,
-      verbose = 2
+      verbose  = 0
     )
     
     best_it <- fit$best_iteration
@@ -480,21 +482,19 @@ xgb_cv_score <- function(max_depth, min_child_weight, subsample, colsample_bytre
   }
   
   best_rmse <- mean(fold_rmses)
-  # Use a robust summary for final nrounds suggestion
   best_iter <- as.integer(median(fold_bestit))
-  
   list(Score = -best_rmse, nrounds = best_iter)
 }
 
 bounds <- list(
-  max_depth        = c(3L, 10L),
+  max_depth        = c(1L, 10L),
   min_child_weight = c(1, 10),
   subsample        = c(0.5, 1.0),
   colsample_bytree = c(0.5, 1.0),
   eta              = c(0.01, 0.30),
   gamma            = c(0, 5),
-  lambda           = c(0, 5),
-  alpha            = c(0, 5)
+  lambda           = c(0, 20),
+  alpha            = c(0, 20)
 )
 
 set.seed(2025)
@@ -517,7 +517,7 @@ params_final <- c(
 set.seed(2025)
 cv_best <- xgb.cv(
   params = params_final, data = dall, nrounds = 1000,
-  folds = folds, early_stopping_rounds = 20,
+  folds = folds, early_stopping_rounds = 50,
   maximize = FALSE, verbose = 0
 )
 best_iter <- cv_best$best_iteration
@@ -821,17 +821,27 @@ suppressPackageStartupMessages({
   library(ggplot2)
 })
 
-# --- generic fitter: quantile-bin then weighted least squares y ~ x ---
-fit_units_line <- function(df, x, y, nbins = 25) {
+fit_units_line <- function(df, x, y, nbins = 25, min_x = -Inf) {
   stopifnot(all(c(x, y) %in% names(df)))
-  dat <- df %>%
+  
+  dat_raw <- df %>%
     filter(!is.na(.data[[x]]), !is.na(.data[[y]])) %>%
-    mutate(.y = as.numeric(.data[[y]])) %>%
-    mutate(.bin = ggplot2::cut_number(.data[[x]], n = nbins)) %>%
+    filter(.data[[x]] >= min_x)
+  
+  # guardrails: need at least 2 distinct x values to fit a line
+  if (nrow(dat_raw) < 2 || dplyr::n_distinct(dat_raw[[x]]) < 2) {
+    return(list(m = NA_real_, b = NA_real_, equation = NA_character_, bins = tibble(), lm = NULL))
+  }
+  
+  # cut into quantile bins (cap n at distinct x count)
+  nb <- min(nbins, dplyr::n_distinct(dat_raw[[x]]))
+  dat <- dat_raw %>%
+    mutate(.y = as.numeric(.data[[y]]),
+           .bin = ggplot2::cut_number(.data[[x]], n = nb)) %>%
     group_by(.bin) %>%
     summarise(
-      x = median(.data[[x]], na.rm = TRUE),   # robust bin center
-      y = mean(.y, na.rm = TRUE),             # mean hit rate in bin
+      x = median(.data[[x]], na.rm = TRUE),
+      y = mean(.y, na.rm = TRUE),
       n = n(),
       .groups = "drop"
     ) %>%
@@ -850,34 +860,35 @@ fit_units_line <- function(df, x, y, nbins = 25) {
   list(m = m, b = b, equation = eq, bins = dat, lm = fit)
 }
 
-# --- 1) Spread: Hit vs pick_margin ---
-spread_fit <- fit_units_line(oos_games, x = "pick_margin", y = "Hit", nbins = 25)
+# --- 1) Spread: Hit vs pick_margin (x >= 1) ---
+spread_fit <- fit_units_line(oos_games, x = "pick_margin", y = "Hit", nbins = 25, min_x = 1)
 spread_units_line <- spread_fit$equation
 spread_units_line
-# e.g. "y = 0.012345 * x + 0.502345"
 
-# --- 2) Totals (OU): ou_Hit vs ou_pick_margin ---
-ou_fit <- fit_units_line(oos_games, x = "ou_pick_margin", y = "ou_Hit", nbins = 25)
+# --- 2) Totals: ou_Hit vs ou_pick_margin (x >= 1) ---
+ou_fit <- fit_units_line(oos_games, x = "ou_pick_margin", y = "ou_Hit", nbins = 25, min_x = 1)
 ou_units_line <- ou_fit$equation
 ou_units_line
 
-# (optional) quick plots to sanity-check
+# (optional) sanity-check plots
 if (!is.null(spread_fit$lm)) {
   ggplot(spread_fit$bins, aes(x = x, y = y)) +
     geom_hline(yintercept = 0.524, linetype = 2, linewidth = 0.3) +
     geom_point(aes(size = n), alpha = 0.7) +
     geom_abline(slope = spread_fit$m, intercept = spread_fit$b) +
-    labs(x = "Pick margin (points)", y = "Hit rate", title = paste("Spread:", spread_units_line)) +
-    scale_y_continuous(limits = c(0,1)) + theme_minimal()
+    labs(x = "Pick margin (points ≥ 1)", y = "Hit rate", title = paste("Spread:", spread_units_line)) +
+    scale_y_continuous(limits = c(0,1)) +
+    theme_minimal()
 }
 
 if (!is.null(ou_fit$lm)) {
   ggplot(ou_fit$bins, aes(x = x, y = y)) +
-    geom_point(aes(size = n), alpha = 0.7) +
     geom_hline(yintercept = 0.524, linetype = 2, linewidth = 0.3) +
+    geom_point(aes(size = n), alpha = 0.7) +
     geom_abline(slope = ou_fit$m, intercept = ou_fit$b) +
-    labs(x = "OU pick margin (points)", y = "OU hit rate", title = paste("OU:", ou_units_line)) +
-    scale_y_continuous(limits = c(0,1)) + theme_minimal()
+    labs(x = "OU pick margin (points ≥ 1)", y = "OU hit rate", title = paste("OU:", ou_units_line)) +
+    scale_y_continuous(limits = c(0,1)) +
+    theme_minimal()
 }
 
 qs::qsave(spread_units_line, "spread_units_line.qs")
