@@ -1336,6 +1336,50 @@ if (!nzchar(GAME_PICK_WEBHOOK)) {
   GAME_PICK_WEBHOOK <- "https://discord.com/api/webhooks/1410096344093167777/uvLW1ZSOs0oEqCmAye8GaRKE3cCyVJj2bYFxgeEehiRCkTZnRsZe6CWczxKA7cwU8Bul"
 }
 
+ensure_headless_chrome <- function() {
+  # Pass flags that work well in containers/CI
+  options(chromote.chrome_args = c(
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu"
+  ))
+  # If CHROMOTE_CHROME not set, try common binaries
+  if (!nzchar(Sys.getenv("CHROMOTE_CHROME", ""))) {
+    candidates <- c(
+      "/usr/bin/chromium-browser",
+      "/usr/bin/chromium",
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable"
+    )
+    hit <- candidates[file.exists(candidates)][1]
+    if (!is.na(hit)) Sys.setenv(CHROMOTE_CHROME = hit)
+  }
+  ok <- FALSE
+  try({
+    b <- chromote::Chromote$new()
+    b$close()
+    ok <- TRUE
+  }, silent = TRUE)
+  ok
+}
+
+# ---------- Helper: safe numeric extractor (no cur_data_all() warning) ----------
+# Use within mutate(): ensure_num(pick(everything()), "col_name")
+ensure_num <- function(.picked, nm) {
+  x <- .picked[[nm]]
+  if (is.null(x)) return(rep(NA_real_, nrow(.picked)))
+  suppressWarnings(as.numeric(x))
+}
+
+ensure_signed_spread <- function(.picked, nm) {
+  x <- ensure_num(.picked, nm)
+  is_home <- .picked[["is_home"]]
+  if (is.null(is_home)) return(rep(NA_real_, nrow(.picked)))
+  ifelse(is_home == 1L, -x, x)
+}
+
+# ---------- PNG export with Chrome first, PhantomJS fallback ----------
 send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png") {
   if (nrow(df) == 0) return(FALSE)
   
@@ -1343,23 +1387,42 @@ send_df_as_png <- function(webhook, df, title = NULL, file_path = "tmp_table.png
     gt() %>%
     tab_header(title = title) %>%
     opt_all_caps(FALSE) %>%
-    fmt_number(
-      columns = everything(),
-      decimals = 3
-    )
+    fmt_number(columns = everything(), decimals = 3)
   
-  # save as PNG
-  gtsave(tbl_gt, file_path, expand = 10) # expand ensures no clipping
+  ok <- FALSE
   
-  # send to Discord as file
-  payload <- httr::POST(
+  # Try webshot2 (Chrome/Chromium)
+  if (ensure_headless_chrome()) {
+    ok <- tryCatch({
+      gt::gtsave(tbl_gt, file_path, expand = 10)
+      file.exists(file_path)
+    }, error = function(e) FALSE)
+  }
+  
+  # Fallback: webshot (PhantomJS)
+  if (!ok) {
+    if (requireNamespace("webshot", quietly = TRUE)) {
+      if (!webshot::is_phantomjs_installed()) {
+        # downloads PhantomJS for the runner
+        try(webshot::install_phantomjs(), silent = TRUE)
+      }
+      html_file <- tempfile(fileext = ".html")
+      cat(gt::as_raw_html(tbl_gt), file = html_file)
+      ok <- tryCatch({
+        webshot::webshot(html_file, file_path, vwidth = 1200, zoom = 2)
+        file.exists(file_path)
+      }, error = function(e) FALSE)
+    }
+  }
+  
+  if (!ok) return(FALSE)
+  
+  # POST to Discord
+  httr::POST(
     url = webhook,
     httr::add_headers(`Content-Type` = "multipart/form-data"),
     body = list(file = httr::upload_file(file_path))
-  )
-  
-  sc <- httr::status_code(payload)
-  isTRUE(sc %in% c(200, 204))
+  ) |> httr::status_code() |> (\(sc) isTRUE(sc %in% c(200, 204)))()
 }
 
 post_window_picks_to_discord_png <- function(final_2025_out,
