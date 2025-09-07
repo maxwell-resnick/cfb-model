@@ -510,60 +510,56 @@ ppa_map_2025 <- merged_df %>%
   group_by(season, team) %>%
   summarise(percentPPA = dplyr::first(percentPPA[!is.na(percentPPA)]), .groups = "drop")
 
+ensure_num <- function(.data, nm) {
+  if (nm %in% names(.data)) suppressWarnings(as.numeric(.data[[nm]]))
+  else rep(NA_real_, nrow(.data))
+}
+
+# Signed spread from legacy DB books (flip for home team); if source missing → NA
+ensure_signed_spread <- function(.data, nm) {
+  x <- ensure_num(.data, nm)
+  if (!"is_home" %in% names(.data)) return(rep(NA_real_, nrow(.data)))
+  ifelse(.data$is_home == 1L, -x, x)
+}
+
 merged_df <- merged_df %>%
   mutate(
     # ---- OddsAPI books (already team-perspective) ----
     # DraftKings (use ONLY the OddsAPI fields)
-    dk_formatted_spread              = suppressWarnings(as.numeric(spread_pts_dk)),
-    dk_formatted_spread_price        = suppressWarnings(as.numeric(spread_price_dk)),
-    dk_formatted_overunder           = suppressWarnings(as.numeric(total_num_dk)),
-    dk_formatted_total_over_price    = suppressWarnings(as.numeric(total_over_price_dk)),
-    dk_formatted_total_under_price   = suppressWarnings(as.numeric(total_under_price_dk)),
+    dk_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_dk"),
+    dk_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_dk"),
+    dk_formatted_overunder         = ensure_num(cur_data_all(), "total_num_dk"),
+    dk_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_dk"),
+    dk_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_dk"),
     
     # FanDuel
-    fd_formatted_spread              = suppressWarnings(as.numeric(spread_pts_fd)),
-    fd_formatted_spread_price        = suppressWarnings(as.numeric(spread_price_fd)),
-    fd_formatted_overunder           = suppressWarnings(as.numeric(total_num_fd)),
-    fd_formatted_total_over_price    = suppressWarnings(as.numeric(total_over_price_fd)),
-    fd_formatted_total_under_price   = suppressWarnings(as.numeric(total_under_price_fd)),
+    fd_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_fd"),
+    fd_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_fd"),
+    fd_formatted_overunder         = ensure_num(cur_data_all(), "total_num_fd"),
+    fd_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_fd"),
+    fd_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_fd"),
     
     # BetMGM
-    mgm_formatted_spread             = suppressWarnings(as.numeric(spread_pts_mgm)),
-    mgm_formatted_spread_price       = suppressWarnings(as.numeric(spread_price_mgm)),
-    mgm_formatted_overunder          = suppressWarnings(as.numeric(total_num_mgm)),
-    mgm_formatted_total_over_price   = suppressWarnings(as.numeric(total_over_price_mgm)),
-    mgm_formatted_total_under_price  = suppressWarnings(as.numeric(total_under_price_mgm)),
+    mgm_formatted_spread            = ensure_num(cur_data_all(), "spread_pts_mgm"),
+    mgm_formatted_spread_price      = ensure_num(cur_data_all(), "spread_price_mgm"),
+    mgm_formatted_overunder         = ensure_num(cur_data_all(), "total_num_mgm"),
+    mgm_formatted_total_over_price  = ensure_num(cur_data_all(), "total_over_price_mgm"),
+    mgm_formatted_total_under_price = ensure_num(cur_data_all(), "total_under_price_mgm"),
     
     # ---- Legacy DB books (need home/away sign) ----
     # Bovada
-    bovada_formatted_spread = dplyr::case_when(
-      is_home == 1L ~ -suppressWarnings(as.numeric(bovada_spread)),
-      is_home == 0L ~  suppressWarnings(as.numeric(bovada_spread)),
-      TRUE ~ NA_real_
-    ),
-    bovada_formatted_opening_spread = dplyr::case_when(
-      is_home == 1L ~ -suppressWarnings(as.numeric(bovada_opening_spread)),
-      is_home == 0L ~  suppressWarnings(as.numeric(bovada_opening_spread)),
-      TRUE ~ NA_real_
-    ),
-    bovada_formatted_overunder         = suppressWarnings(as.numeric(bovada_overunder)),
-    bovada_formatted_opening_overunder = suppressWarnings(as.numeric(bovada_opening_overunder)),
+    bovada_formatted_spread            = ensure_signed_spread(cur_data_all(), "bovada_spread"),
+    bovada_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "bovada_opening_spread"),
+    bovada_formatted_overunder         = ensure_num(cur_data_all(), "bovada_overunder"),
+    bovada_formatted_opening_overunder = ensure_num(cur_data_all(), "bovada_opening_overunder"),
     
     # ESPN Bet
-    espnbet_formatted_spread = dplyr::case_when(
-      is_home == 1L ~ -suppressWarnings(as.numeric(espnbet_spread)),
-      is_home == 0L ~  suppressWarnings(as.numeric(espnbet_spread)),
-      TRUE ~ NA_real_
-    ),
-    espnbet_formatted_opening_spread = dplyr::case_when(
-      is_home == 1L ~ -suppressWarnings(as.numeric(espnbet_opening_spread)),
-      is_home == 0L ~  suppressWarnings(as.numeric(espnbet_opening_spread)),
-      TRUE ~ NA_real_
-    ),
-    espnbet_formatted_overunder         = suppressWarnings(as.numeric(espnbet_overunder)),
-    espnbet_formatted_opening_overunder = suppressWarnings(as.numeric(espnbet_opening_overunder))
+    espnbet_formatted_spread            = ensure_signed_spread(cur_data_all(), "espnbet_spread"),
+    espnbet_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "espnbet_opening_spread"),
+    espnbet_formatted_overunder         = ensure_num(cur_data_all(), "espnbet_overunder"),
+    espnbet_formatted_opening_overunder = ensure_num(cur_data_all(), "espnbet_opening_overunder")
   ) %>%
-  # Optionally drop the old DB DraftKings fields so you only keep the OddsAPI DK:
+  # Safe even if no matching columns exist:
   select(-starts_with("draftkings_"))
 
 # ------------------------------------------------------------------------------
