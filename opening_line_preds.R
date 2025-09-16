@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
   library(stringr)
 })
 
-Sys.setenv(ODDS_API_KEY = "cc37e6531ad6f6bb13fd927e81bdf952")
+Sys.setenv(ODDS_API_KEY = "8b0f6018842d0b359afc4aa0b9c251ea")
 
 Sys.getenv("ODDS_API_KEY")
 
