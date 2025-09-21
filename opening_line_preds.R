@@ -539,13 +539,7 @@ merged_df <- merged_df %>%
     bovada_formatted_spread            = ensure_signed_spread(cur_data_all(), "bovada_spread"),
     bovada_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "bovada_opening_spread"),
     bovada_formatted_overunder         = ensure_num(cur_data_all(), "bovada_overunder"),
-    bovada_formatted_opening_overunder = ensure_num(cur_data_all(), "bovada_opening_overunder"),
-    
-    # ESPN Bet (legacy DB)
-    espnbet_formatted_spread            = ensure_signed_spread(cur_data_all(), "espnbet_spread"),
-    espnbet_formatted_opening_spread    = ensure_signed_spread(cur_data_all(), "espnbet_opening_spread"),
-    espnbet_formatted_overunder         = ensure_num(cur_data_all(), "espnbet_overunder"),
-    espnbet_formatted_opening_overunder = ensure_num(cur_data_all(), "espnbet_opening_overunder")
+    bovada_formatted_opening_overunder = ensure_num(cur_data_all(), "bovada_opening_overunder")
   ) %>%
   select(-starts_with("draftkings_"))
 
@@ -582,8 +576,6 @@ spread_scores_keys_2025 <- merged_df %>%
     # DB / legacy books (signed)
     bovada_formatted_spread, bovada_formatted_opening_spread,
     bovada_formatted_overunder, bovada_formatted_opening_overunder,
-    espnbet_formatted_spread, espnbet_formatted_opening_spread,
-    espnbet_formatted_overunder, espnbet_formatted_opening_overunder,
     
     # OddsAPI books (team-perspective)
     dk_formatted_spread,          dk_formatted_spread_price,
@@ -754,7 +746,6 @@ if (!exists("avg_row", mode = "function")) {
 ou_open_cols <- intersect(
   c(
     "bovada_formatted_opening_overunder",
-    "espnbet_formatted_opening_overunder",  # keep/remove as you wish
     # use current books as fallback signal for opening OU level
     "dk_formatted_overunder",
     "fd_formatted_overunder",
@@ -769,7 +760,6 @@ ou_curr_cols <- intersect(
     "fd_formatted_overunder",
     "mgm_formatted_overunder",
     "bovada_formatted_overunder",
-    "espnbet_formatted_overunder"
   ),
   names(spread_scores_keys_2025)
 )
@@ -797,14 +787,12 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
     # OPENING lines (your existing construction)
     formatted_opening_spread = avg_row(
       bovada_formatted_opening_spread,
-      espnbet_formatted_opening_spread,
       dk_formatted_spread,
       fd_formatted_spread,
       mgm_formatted_spread
     ),
     formatted_opening_overunder = avg_row(
       bovada_formatted_opening_overunder,
-      espnbet_formatted_opening_overunder,
       dk_formatted_overunder,
       fd_formatted_overunder,
       mgm_formatted_overunder
@@ -822,15 +810,13 @@ spread_scores_keys_2025 <- spread_scores_keys_2025 %>%
       dk_formatted_spread,
       fd_formatted_spread,
       mgm_formatted_spread,
-      bovada_formatted_spread,
-      espnbet_formatted_spread
+      bovada_formatted_spread
     ),
     formatted_overunder = avg_row(
       dk_formatted_overunder,
       fd_formatted_overunder,
       mgm_formatted_overunder,
-      bovada_formatted_overunder,
-      espnbet_formatted_overunder
+      bovada_formatted_overunder
     ),
     
     # (Optional) GLOBAL IMPUTE for current OU too — comment out if not desired
@@ -863,18 +849,13 @@ passing_rate_df <- passing_rate_df %>%
     is_home == 0L ~  bovada_opening_spread,
     TRUE          ~ NA_real_
     ),
-    espnbet_formatted_opening_spread = case_when(
-      is_home == 1L ~ -espnbet_opening_spread,
-      is_home == 0L ~  espnbet_opening_spread,
-      TRUE          ~ NA_real_
-    ),
     draftkings_formatted_opening_spread = case_when(
       is_home == 1L ~ -draftkings_opening_spread,
       is_home == 0L ~  draftkings_opening_spread,
       TRUE          ~ NA_real_
     ),
     formatted_opening_spread = avg3(
-      bovada_formatted_opening_spread, espnbet_formatted_opening_spread, draftkings_formatted_opening_spread
+      bovada_formatted_opening_spread, draftkings_formatted_opening_spread
     )
   )
 
@@ -1028,23 +1009,23 @@ ensure_cols <- function(df, cols, default = NA_real_) {
 
 pred_2025 <- ensure_cols(
   pred_2025,
-  c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread",
-    "dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price","espnbet_formatted_spread_price",
-    "dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder",
-    "dk_formatted_total_over_price","fd_formatted_total_over_price","mgm_formatted_total_over_price","espnbet_formatted_total_over_price",
-    "dk_formatted_total_under_price","fd_formatted_total_under_price","mgm_formatted_total_under_price","espnbet_formatted_total_under_price")
+  c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread",
+    "dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price",
+    "dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder",
+    "dk_formatted_total_over_price","fd_formatted_total_over_price","mgm_formatted_total_over_price",
+    "dk_formatted_total_under_price","fd_formatted_total_under_price","mgm_formatted_total_under_price")
 )
 
 # Small epsilon for push checks
 if (!exists("eps", inherits = TRUE)) eps <- 1e-3
 
 # -----------------------------
-# Vectorized SPREAD pick (DK / FD / MGM / ESPN)
+# Vectorized SPREAD pick (DK / FD / MGM)
 # -----------------------------
-book_names  <- c("draftkings","fanduel","betmgm","espnbet")
+book_names  <- c("draftkings","fanduel","betmgm")
 
-L_spread <- as.matrix(pred_2025[, c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread","espnbet_formatted_spread")])
-P_spread <- as.matrix(pred_2025[, c("dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price","espnbet_formatted_spread_price")])
+L_spread <- as.matrix(pred_2025[, c("dk_formatted_spread","fd_formatted_spread","mgm_formatted_spread")])
+P_spread <- as.matrix(pred_2025[, c("dk_formatted_spread_price","fd_formatted_spread_price","mgm_formatted_spread_price")])
 
 n <- nrow(pred_2025)
 if (is.null(dim(L_spread))) L_spread <- matrix(L_spread, nrow = n)   # guard for 1-row edge case
@@ -1106,8 +1087,7 @@ picks_2025 <- pred_2025 %>%
     best_book, best_line, pick_margin, cover_margin, Hit,
     dk_formatted_spread,  dk_formatted_spread_price,
     fd_formatted_spread,  fd_formatted_spread_price,
-    mgm_formatted_spread, mgm_formatted_spread_price,
-    espnbet_formatted_spread, espnbet_formatted_spread_price
+    mgm_formatted_spread, mgm_formatted_spread_price
   ) %>%
   group_by(id) %>%
   slice_max(order_by = pick_margin, n = 1, with_ties = FALSE) %>%
@@ -1116,13 +1096,13 @@ picks_2025 <- pred_2025 %>%
 stopifnot(anyDuplicated(picks_2025$id) == 0)
 
 # -----------------------------
-# Vectorized TOTAL pick (DK / FD / MGM / ESPN)
+# Vectorized TOTAL pick (DK / FD / MGM)
 # -----------------------------
-L_total <- as.matrix(pred_2025[, c("dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder","espnbet_formatted_overunder")])
+L_total <- as.matrix(pred_2025[, c("dk_formatted_overunder","fd_formatted_overunder","mgm_formatted_overunder")])
 PO      <- as.matrix(pred_2025[, c("dk_formatted_total_over_price","fd_formatted_total_over_price",
-                                   "mgm_formatted_total_over_price","espnbet_formatted_total_over_price")])
+                                   "mgm_formatted_total_over_price")])
 PU      <- as.matrix(pred_2025[, c("dk_formatted_total_under_price","fd_formatted_total_under_price",
-                                   "mgm_formatted_total_under_price","espnbet_formatted_total_under_price")])
+                                   "mgm_formatted_total_under_price")])
 
 if (is.null(dim(L_total))) L_total <- matrix(L_total, nrow = n)
 if (is.null(dim(PO)))      PO      <- matrix(PO, nrow = n)
@@ -1252,11 +1232,11 @@ if (!exists("ou_coefs",     inherits = TRUE)) ou_coefs     <- load_units_line("o
 # ---------- bring per-book TOTALS columns from pred_2025 ----------
 ou_cols <- c(
   "dk_formatted_overunder","fd_formatted_overunder",
-  "mgm_formatted_overunder","espnbet_formatted_overunder",
+  "mgm_formatted_overunder",
   "dk_formatted_total_over_price","fd_formatted_total_over_price",
-  "mgm_formatted_total_over_price","espnbet_formatted_total_over_price",
+  "mgm_formatted_total_over_price",
   "dk_formatted_total_under_price","fd_formatted_total_under_price",
-  "mgm_formatted_total_under_price","espnbet_formatted_total_under_price"
+  "mgm_formatted_total_under_price"
 )
 for (nm in setdiff(ou_cols, names(pred_2025))) pred_2025[[nm]] <- NA_real_
 
@@ -1282,7 +1262,6 @@ final_2025_out <- picks_2025 %>%
       dk_formatted_spread = -dk_formatted_spread,
       fd_formatted_spread = -fd_formatted_spread,
       mgm_formatted_spread = -mgm_formatted_spread,
-      espnbet_formatted_spread = -espnbet_formatted_spread,
       spread_pick = dplyr::if_else(
       is.na(team) | is.na(best_line), NA_character_,
       paste0(team, " ", fmt_line(best_line))
@@ -1314,7 +1293,6 @@ final_2025_out <- picks_2025 %>%
     dk_formatted_spread,      dk_formatted_spread_price,
     fd_formatted_spread,      fd_formatted_spread_price,
     mgm_formatted_spread,     mgm_formatted_spread_price,
-    espnbet_formatted_spread, espnbet_formatted_spread_price,
     # totals per-book
     dplyr::all_of(ou_cols)
   ) %>%
