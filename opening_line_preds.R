@@ -242,11 +242,6 @@ load_model_bundle <- function(path) {
   list(model = mdl, features_used = features_used)
 }
 
-avg3 <- function(a,b,c){
-  n <- (!is.na(a))+(!is.na(b))+(!is.na(c))
-  (dplyr::coalesce(a,0)+dplyr::coalesce(b,0)+dplyr::coalesce(c,0)) / ifelse(n==0, NA_real_, n)
-}
-
 connect_neon <- function() {
   url <- Sys.getenv("DATABASE_URL", unset = "")
   if (!nzchar(url)) stop("DATABASE_URL is not set")
@@ -759,7 +754,7 @@ ou_curr_cols <- intersect(
     "dk_formatted_overunder",
     "fd_formatted_overunder",
     "mgm_formatted_overunder",
-    "bovada_formatted_overunder",
+    "bovada_formatted_overunder"
   ),
   names(spread_scores_keys_2025)
 )
@@ -836,18 +831,18 @@ con <- connect_neon()
 
 passing_rate_df <- dbGetQuery(con, 'SELECT * FROM "PreparedData" WHERE season >= 2023;')
 
-avg3 <- function(a, b, c) {
+avg3 <- function(a, b, c = NA_real_) {
   n <- (!is.na(a)) + (!is.na(b)) + (!is.na(c))
   (coalesce(a, 0) + coalesce(b, 0) + coalesce(c, 0)) / ifelse(n == 0, NA_real_, n)
 }
 
 passing_rate_df <- passing_rate_df %>%
   mutate(
-    is_home = ifelse(homeTeam == team, 1, 0),
+    is_home = ifelse(homeTeam == team, 1L, 0L),
     bovada_formatted_opening_spread = case_when(
-    is_home == 1L ~ -bovada_opening_spread,
-    is_home == 0L ~  bovada_opening_spread,
-    TRUE          ~ NA_real_
+      is_home == 1L ~ -bovada_opening_spread,
+      is_home == 0L ~  bovada_opening_spread,
+      TRUE          ~ NA_real_
     ),
     draftkings_formatted_opening_spread = case_when(
       is_home == 1L ~ -draftkings_opening_spread,
@@ -855,7 +850,8 @@ passing_rate_df <- passing_rate_df %>%
       TRUE          ~ NA_real_
     ),
     formatted_opening_spread = avg3(
-      bovada_formatted_opening_spread, draftkings_formatted_opening_spread
+      bovada_formatted_opening_spread,
+      draftkings_formatted_opening_spread
     )
   )
 
